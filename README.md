@@ -435,6 +435,25 @@ patterns), and it's a different kind of component from account normalization
 existing `RecurringPayment[]` input still has to come from somewhere else
 until that's built.
 
+### Wired to a caller
+
+```http
+POST /v1/batches/:id/import/powens
+{"rows": [{"externalRef": "...", "firstName": "...", ..., "rawAccounts": [ /* raw Powens accounts */ ]}]}
+```
+
+`BatchPipeline.importFromProvider(ctx, batchId, provider, rows)` takes a
+`ConnectivityProvider` and rows of raw accounts, normalizes each customer's
+accounts before `putProducts`, and reports the result the same way
+`importRows` already does: a customer with *some* accounts skipped still
+imports (`skipped_accounts` in the response), a customer with *every* account
+unusable is an import failure, and one failing customer never stops the rest
+of the batch. `server.ts` dispatches `:provider` against a small registry
+(`{ powens: PowensProvider }` today) and 422s an unknown one rather than
+guessing which provider was meant. Verified against a live server, not just
+the test suite: `POST .../import/powens` end to end, including the 422 for an
+unregistered provider name.
+
 ## Not built (deliberately)
 
 **No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
@@ -447,16 +466,11 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 ### Next
 
-1. Wire `PowensProvider` into the batch/API path — today it's a pure mapper
-   with no caller; `importRows` still takes pre-normalized `ImportRow`s. The
-   natural seam is a new import path that takes raw Powens accounts and calls
-   `normalizeAccounts` before `putProducts`, reporting `skipped` alongside the
-   existing per-row `BatchFailure`s.
-2. A recurring-payment detector — the input `RecurringPayment[]` still has to
+1. A recurring-payment detector — the input `RecurringPayment[]` still has to
    come from somewhere; see Milestone 4.
-3. If the remaining ~7s on a 500-customer Postgres plan matters at real
+2. If the remaining ~7s on a 500-customer Postgres plan matters at real
    volume: batch *across* customers, not just within one — deliberately not
    done yet, because it trades away the per-customer transaction isolation
    `importRows` currently gives failure handling.
-4. Get the rule catalog in front of counsel before anything above is built on
+3. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.

@@ -6,6 +6,7 @@ import type {
 } from '../domain/types.js';
 import type { BatchRecord, MigrationStore, TenantContext } from '../store/types.js';
 import { MigrationService, newId, ValidationError } from '../api/service.js';
+import type { ConnectivityProvider, SkippedAccount } from '../connectivity/types.js';
 
 /**
  * Mass institutional migration (§20 of the brief).
@@ -18,7 +19,8 @@ import { MigrationService, newId, ValidationError } from '../api/service.js';
  * the rest of the population proceeds.
  */
 
-export interface ImportRow {
+/** Customer-identity fields every import row carries, whatever it carries them for. */
+export interface ImportRowIdentity {
   externalRef: string;
   firstName: string;
   lastName: string;
@@ -26,11 +28,30 @@ export interface ImportRow {
   fiscalResidence?: string;
   consentScopes?: Consent['scopes'];
   consentExpiresAt?: string;
+}
+
+export interface ImportRow extends ImportRowIdentity {
   products: Omit<
     FinancialProduct,
     'id' | 'customerId' | 'institutionId' | 'accountId'
   >[];
   recurringPayments?: Omit<RecurringPayment, 'id' | 'customerId' | 'accountId'>[];
+}
+
+/**
+ * A row for `importFromProvider` — the accounts arrive exactly as the
+ * provider returned them, unnormalized. Everything downstream of
+ * `provider.normalizeAccounts` is identical to the plain `importRows` path.
+ */
+export interface ProviderImportRow extends ImportRowIdentity {
+  rawAccounts: unknown[];
+}
+
+export interface ProviderImportResult {
+  imported: string[];
+  failures: BatchFailure[];
+  /** Accounts the provider returned that no product type could be assigned to — reported, not dropped. */
+  skippedAccounts: (SkippedAccount & { customerId: string; externalRef: string })[];
 }
 
 export interface BatchFailure {
@@ -91,6 +112,40 @@ export class BatchPipeline {
     return batch;
   }
 
+  /** Shared by every import path: the consent + identity fields every row carries. */
+  private newCustomer(
+    ctx: TenantContext,
+    institutionId: string,
+    customerId: string,
+    row: ImportRowIdentity,
+  ): Customer {
+    const consent: Consent = {
+      id: newId('con'),
+      scopes: row.consentScopes ?? [
+        'ACCOUNT_INFORMATION',
+        'TRANSACTION_HISTORY',
+        'MIGRATION_EXECUTION',
+      ],
+      grantedAt: this.clock().toISOString(),
+      expiresAt:
+        row.consentExpiresAt ?? new Date(this.clock().getTime() + 365 * 864e5).toISOString(),
+    };
+    return {
+      id: customerId,
+      tenantId: ctx.tenantId,
+      institutionId,
+      identity: {
+        firstName: row.firstName,
+        lastName: row.lastName,
+        dateOfBirth: row.dateOfBirth,
+        countryOfResidence: 'FR',
+        fiscalResidence: (row.fiscalResidence as Customer['identity']['fiscalResidence']) ?? 'FR',
+      },
+      consent,
+      migrationIds: [],
+    };
+  }
+
   /**
    * Import a population. A row that cannot be materialised is recorded as a
    * failure and skipped — never thrown, because one malformed record in a
@@ -110,38 +165,12 @@ export class BatchPipeline {
     for (const row of rows) {
       try {
         const customerId = newId('cus');
-        const consent: Consent = {
-          id: newId('con'),
-          scopes: row.consentScopes ?? [
-            'ACCOUNT_INFORMATION',
-            'TRANSACTION_HISTORY',
-            'MIGRATION_EXECUTION',
-          ],
-          grantedAt: this.clock().toISOString(),
-          expiresAt:
-            row.consentExpiresAt ??
-            new Date(this.clock().getTime() + 365 * 864e5).toISOString(),
-        };
 
         if (row.products.length === 0) {
           throw new Error('no financial products supplied');
         }
 
-        const customer: Customer = {
-          id: customerId,
-          tenantId: ctx.tenantId,
-          institutionId: batch.originInstitutionId,
-          identity: {
-            firstName: row.firstName,
-            lastName: row.lastName,
-            dateOfBirth: row.dateOfBirth,
-            countryOfResidence: 'FR',
-            fiscalResidence: (row.fiscalResidence as Customer['identity']['fiscalResidence']) ?? 'FR',
-          },
-          consent,
-          migrationIds: [],
-        };
-
+        const customer = this.newCustomer(ctx, batch.originInstitutionId, customerId, row);
         await this.store.putCustomer(ctx, customer);
 
         await this.store.putProducts(
@@ -182,6 +211,80 @@ export class BatchPipeline {
     });
 
     return { imported, failures };
+  }
+
+  /**
+   * Import a population from a connectivity provider's raw accounts, rather
+   * than already-normalized `FinancialProduct`s. `provider.normalizeAccounts`
+   * does the classification (§5); this method does exactly what `importRows`
+   * does with the result — one bad customer, or one customer whose every
+   * account came back unclassifiable, is recorded and skipped, never thrown.
+   *
+   * A customer with SOME accounts skipped still imports: `skippedAccounts`
+   * reports what was left out without failing a customer over a partial gap.
+   * A customer with ALL accounts skipped is an import failure — the same
+   * "no financial products supplied" case `importRows` already treats as one,
+   * just arrived at through the provider instead of an empty `products[]`.
+   */
+  async importFromProvider(
+    ctx: TenantContext,
+    batchId: string,
+    provider: ConnectivityProvider,
+    rows: ProviderImportRow[],
+  ): Promise<ProviderImportResult> {
+    const batch = await this.store.getBatch(ctx, batchId);
+    if (!batch) throw new ValidationError(`Unknown batch ${batchId}`, 'batch_id');
+
+    const imported: string[] = [];
+    const failures: BatchFailure[] = [];
+    const skippedAccounts: ProviderImportResult['skippedAccounts'] = [];
+
+    for (const row of rows) {
+      try {
+        const customerId = newId('cus');
+        const { products, skipped } = provider.normalizeAccounts(row.rawAccounts, {
+          customerId,
+          institutionId: batch.originInstitutionId,
+        });
+
+        if (products.length === 0) {
+          throw new Error(
+            skipped.length > 0
+              ? `every account ${provider.id} returned was unusable: ${skipped
+                  .map((s) => s.reason)
+                  .join('; ')}`
+              : `${provider.id} returned no accounts`,
+          );
+        }
+
+        const customer = this.newCustomer(ctx, batch.originInstitutionId, customerId, row);
+        await this.store.putCustomer(ctx, customer);
+        await this.store.putProducts(ctx, products);
+        // Recurring payments aren't part of this path: no connectivity
+        // provider here detects them (Powens doesn't — see README Milestone
+        // 4). A row that wants recurring payments imported still goes
+        // through importRows.
+
+        imported.push(customerId);
+        for (const s of skipped) {
+          skippedAccounts.push({ ...s, customerId, externalRef: row.externalRef });
+        }
+      } catch (err) {
+        failures.push({
+          externalRef: row.externalRef,
+          customerId: null,
+          reason: err instanceof Error ? err.message : String(err),
+          stage: 'IMPORT',
+        });
+      }
+    }
+
+    await this.store.updateBatch(ctx, batchId, {
+      totalCustomers: batch.totalCustomers + imported.length,
+      failedCount: batch.failedCount + failures.length,
+    });
+
+    return { imported, failures, skippedAccounts };
   }
 
   /** Plan every imported customer in bounded-concurrency chunks. */

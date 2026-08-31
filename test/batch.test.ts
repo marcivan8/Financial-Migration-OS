@@ -2,9 +2,11 @@ import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { wire, seedTenant, type Wiring } from '../src/api/bootstrap.js';
 import type { SeedResult } from '../src/api/bootstrap.js';
 import type { TenantContext } from '../src/store/types.js';
-import type { ImportRow } from '../src/batch/pipeline.js';
+import type { ImportRow, ProviderImportRow } from '../src/batch/pipeline.js';
 import { money } from '../src/domain/types.js';
 import { freshStore, closeTestStore } from './testStore.js';
+import { PowensProvider } from '../src/connectivity/powens.js';
+import { POWENS_SAMPLE_ACCOUNTS } from '../src/connectivity/fixtures/powens-sample.js';
 
 let w: Wiring;
 let seed: SeedResult;
@@ -83,6 +85,73 @@ describe('bulk import', () => {
     expect(result.failures).toHaveLength(1);
     expect(result.failures[0]!.externalRef).toBe('EXT-2');
     expect(result.failures[0]!.stage).toBe('IMPORT');
+  });
+});
+
+describe('provider import (Powens)', () => {
+  const providerRow = (n: number, overrides: Partial<ProviderImportRow> = {}): ProviderImportRow => ({
+    externalRef: `EXT-${n}`,
+    firstName: `Client${n}`,
+    lastName: 'Martin',
+    dateOfBirth: '1990-01-01',
+    rawAccounts: POWENS_SAMPLE_ACCOUNTS,
+    ...overrides,
+  });
+
+  it('imports a customer from raw provider accounts, normalized on the way in', async () => {
+    const batch = await newBatch();
+    const result = await w.batches.importFromProvider(ctx, batch.id, PowensProvider, [providerRow(1)]);
+
+    expect(result.imported).toHaveLength(1);
+    expect(result.failures).toHaveLength(0);
+
+    const products = await w.store.listProducts(ctx, result.imported[0]!);
+    // POWENS_SAMPLE_ACCOUNTS has 9 raw accounts; 6 map to a ProductType (see
+    // connectivity.test.ts), the rest are reported skipped below.
+    expect(products).toHaveLength(6);
+    expect(products.every((p) => p.sourceProvider === 'powens')).toBe(true);
+  });
+
+  it('reports unmapped accounts as skipped without failing the customer they belong to', async () => {
+    const batch = await newBatch();
+    const result = await w.batches.importFromProvider(ctx, batch.id, PowensProvider, [providerRow(1)]);
+
+    expect(result.failures).toHaveLength(0);
+    // "savings" (ambiguous), "crowdlending" (out of scope), the deleted
+    // livret_a — three of the nine sample accounts, all skipped, none of
+    // them turning the whole customer into an import failure.
+    expect(result.skippedAccounts).toHaveLength(3);
+    expect(result.skippedAccounts.every((s) => s.customerId === result.imported[0])).toBe(true);
+    expect(result.skippedAccounts.map((s) => s.rawType).sort()).toEqual(
+      ['crowdlending', 'livret_a', 'savings'].sort(),
+    );
+  });
+
+  it('fails the customer, not just skips, when every account is unusable', async () => {
+    const batch = await newBatch();
+    const onlyUnmappable = [POWENS_SAMPLE_ACCOUNTS[7]!]; // crowdlending — outside the MVP product set
+    const result = await w.batches.importFromProvider(ctx, batch.id, PowensProvider, [
+      providerRow(1, { rawAccounts: onlyUnmappable }),
+    ]);
+
+    expect(result.imported).toHaveLength(0);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.stage).toBe('IMPORT');
+    expect(result.failures[0]!.reason).toMatch(/every account powens returned was unusable/);
+  });
+
+  it('keeps importing the rest of the batch after one customer fails', async () => {
+    const batch = await newBatch();
+    const rows = [
+      providerRow(1),
+      providerRow(2, { rawAccounts: [POWENS_SAMPLE_ACCOUNTS[7]!] }), // fails: unusable
+      providerRow(3),
+    ];
+    const result = await w.batches.importFromProvider(ctx, batch.id, PowensProvider, rows);
+
+    expect(result.imported).toHaveLength(2);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.externalRef).toBe('EXT-2');
   });
 });
 

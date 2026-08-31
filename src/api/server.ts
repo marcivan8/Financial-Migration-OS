@@ -28,6 +28,13 @@ import {
   RUNTIME_EXCEPTION_CODES,
   isRuntimeExceptionCode,
 } from '../domain/migration.js';
+import type { ConnectivityProvider } from '../connectivity/types.js';
+import { PowensProvider } from '../connectivity/powens.js';
+
+/** Every connectivity provider POST /v1/batches/:id/import/:provider can dispatch to. */
+const CONNECTIVITY_PROVIDERS: Record<string, ConnectivityProvider> = {
+  [PowensProvider.id]: PowensProvider,
+};
 
 /**
  * Fastify rather than NestJS.
@@ -567,6 +574,35 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
 
     const { imported, failures } = await batches.importRows(req.ctx, id, body.rows as never);
     return { batch_id: id, imported: imported.length, customer_ids: imported, failures };
+  });
+
+  app.post('/v1/batches/:id/import/:provider', async (req) => {
+    const { id, provider: providerId } = req.params as { id: string; provider: string };
+    await guard(req, 'batches:write', 'batch', id);
+    const provider = CONNECTIVITY_PROVIDERS[providerId];
+    if (!provider) {
+      throw new ValidationError(
+        `Unknown connectivity provider "${providerId}". Expected one of: ${Object.keys(CONNECTIVITY_PROVIDERS).join(', ')}`,
+        'provider',
+      );
+    }
+    const body = req.body as { rows?: unknown[] };
+    if (!Array.isArray(body?.rows)) throw new ValidationError('rows[] is required', 'rows');
+
+    const { imported, failures, skippedAccounts } = await batches.importFromProvider(
+      req.ctx,
+      id,
+      provider,
+      body.rows as never,
+    );
+    return {
+      batch_id: id,
+      provider: provider.id,
+      imported: imported.length,
+      customer_ids: imported,
+      failures,
+      skipped_accounts: skippedAccounts,
+    };
   });
 
   app.post('/v1/batches/:id/plan', async (req) => {
