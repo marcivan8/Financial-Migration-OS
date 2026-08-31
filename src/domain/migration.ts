@@ -138,7 +138,18 @@ export interface DocumentRequirement {
 // Exceptions
 // ---------------------------------------------------------------------------
 
-export type ExceptionCode =
+/**
+ * The exception vocabulary is closed on purpose.
+ *
+ * It is what the dashboard groups by and what an institution reports on, so a
+ * free-text code would fragment the queue into one row per caller's spelling.
+ * The API rejects a code outside this list rather than coercing it to something
+ * generic — silently rewriting MISSING_DOCUMENT to MANUAL_REVIEW_REQUIRED loses
+ * the one fact the operator needed.
+ *
+ * Planning-time causes (the rules engine raises these):
+ */
+export type PlanExceptionCode =
   | 'PRODUCT_NOT_SUPPORTED_AT_DESTINATION'
   | 'PRODUCT_NOT_TRANSFERABLE'
   | 'DUPLICATE_REGULATED_PRODUCT'
@@ -148,6 +159,35 @@ export type ExceptionCode =
   | 'DESTINATION_CAPABILITY_MISSING'
   | 'LOW_CONFIDENCE_RECURRING_PAYMENT'
   | 'MANUAL_REVIEW_REQUIRED';
+
+/** Execution-time causes (§14 of the brief — real migrations fail like this): */
+export type RuntimeExceptionCode =
+  | 'MISSING_DOCUMENT'
+  | 'ORIGIN_UNRESPONSIVE'
+  | 'DESTINATION_REJECTED'
+  | 'INVALID_IBAN'
+  | 'CUSTOMER_UNRESPONSIVE'
+  | 'CONFLICTING_INFORMATION'
+  | 'REGULATORY_RESTRICTION';
+
+export type ExceptionCode = PlanExceptionCode | RuntimeExceptionCode;
+
+/** Codes the API accepts on POST /v1/migrations/:id/actions with block_task. */
+export const RUNTIME_EXCEPTION_CODES: readonly ExceptionCode[] = [
+  'MISSING_DOCUMENT',
+  'ORIGIN_UNRESPONSIVE',
+  'DESTINATION_REJECTED',
+  'INVALID_IBAN',
+  'CUSTOMER_UNRESPONSIVE',
+  'CONFLICTING_INFORMATION',
+  'REGULATORY_RESTRICTION',
+  'MANUAL_REVIEW_REQUIRED',
+] as const;
+
+export const isRuntimeExceptionCode = (
+  code: string,
+): code is RuntimeExceptionCode | 'MANUAL_REVIEW_REQUIRED' =>
+  (RUNTIME_EXCEPTION_CODES as readonly string[]).includes(code);
 
 export type ExceptionSeverity = 'INFO' | 'WARNING' | 'BLOCKING';
 

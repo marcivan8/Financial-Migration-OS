@@ -24,6 +24,10 @@ import {
   taskJson,
 } from './serializers.js';
 import { renderDashboard } from './dashboard.js';
+import {
+  RUNTIME_EXCEPTION_CODES,
+  isRuntimeExceptionCode,
+} from '../domain/migration.js';
 
 /**
  * Fastify rather than NestJS.
@@ -406,6 +410,15 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
       case 'complete_task':
       case 'block_task': {
         if (!body.task_id) throw new ValidationError('task_id is required', 'task_id');
+        // A free-text code would fragment the operations queue into one row per
+        // caller's spelling, so an unknown one is rejected here rather than
+        // quietly rewritten to something generic further down.
+        if (body.action === 'block_task' && body.code && !isRuntimeExceptionCode(body.code)) {
+          throw new ValidationError(
+            `Unknown exception code "${body.code}". Expected one of: ${RUNTIME_EXCEPTION_CODES.join(', ')}`,
+            'code',
+          );
+        }
         const map = {
           start_task: 'start',
           complete_task: 'complete',
@@ -449,13 +462,19 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     const { id } = req.params as { id: string };
     await guard(req, 'exceptions:resolve', 'exception', id);
     const body = req.body as { note?: string };
-    await store.resolveException(
+    const result = await service.resolveException(
       req.ctx,
       id,
       req.ctx.apiKeyId ?? 'unknown',
       body?.note ?? '',
     );
-    return { id, resolved: true };
+    return {
+      id,
+      resolved: true,
+      migration_id: result.migrationId,
+      state: result.state,
+      blocking_remaining: result.blockingRemaining,
+    };
   });
 
   // -------------------------------------------------------------------------

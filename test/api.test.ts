@@ -488,3 +488,152 @@ describe('partial completion is visible', () => {
     expect(html).toContain('Left behind');
   });
 });
+
+describe('exception lifecycle (regressions)', () => {
+  const firstBlockingId = async () => {
+    const rows = (await app.inject({ method: 'GET', url: '/v1/exceptions', headers: auth() })).json()
+      .data as { id: string; severity: string }[];
+    return rows.find((e) => e.severity === 'BLOCKING')!.id;
+  };
+
+  it('a task blocked at runtime reaches the operations queue, not just the event log', async () => {
+    const id = (await createMigration('exc-1')).json().id;
+    await app.inject({ method: 'POST', url: `/v1/migrations/${id}/authorize`, headers: auth() });
+    const tasks = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}/tasks`, headers: auth() })
+    ).json().data as { id: string; type: string }[];
+    const target = tasks.find((t) => t.type === 'OPEN_DESTINATION_PRODUCT')!;
+
+    await app.inject({
+      method: 'POST',
+      url: `/v1/migrations/${id}/actions`,
+      headers: auth(),
+      payload: {
+        action: 'block_task',
+        task_id: target.id,
+        code: 'MISSING_DOCUMENT',
+        message: 'Customer has not supplied proof of address',
+      },
+    });
+
+    const open = (await app.inject({ method: 'GET', url: '/v1/exceptions', headers: auth() })).json()
+      .data as { code: string; resolution: string }[];
+    // Emitting only an event left the migration in ACTION_REQUIRED with nothing
+    // in the queue explaining why — the operator could not find it.
+    const raised = open.find((e) => e.code === 'MISSING_DOCUMENT');
+    expect(raised).toBeDefined();
+    expect(raised!.resolution).toContain('destination institution');
+  });
+
+  it('preserves the cause instead of flattening it to a generic code', async () => {
+    const id = (await createMigration('exc-2')).json().id;
+    await app.inject({ method: 'POST', url: `/v1/migrations/${id}/authorize`, headers: auth() });
+    const tasks = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}/tasks`, headers: auth() })
+    ).json().data as { id: string; type: string }[];
+
+    await app.inject({
+      method: 'POST',
+      url: `/v1/migrations/${id}/actions`,
+      headers: auth(),
+      payload: {
+        action: 'block_task',
+        task_id: tasks.find((t) => t.type === 'OPEN_DESTINATION_PRODUCT')!.id,
+        code: 'ORIGIN_UNRESPONSIVE',
+        message: 'No acknowledgement after 30 days',
+      },
+    });
+
+    const codes = (
+      (await app.inject({ method: 'GET', url: '/v1/exceptions', headers: auth() })).json()
+        .data as { code: string }[]
+    ).map((e) => e.code);
+    expect(codes).toContain('ORIGIN_UNRESPONSIVE');
+    expect(codes).not.toContain('MANUAL_REVIEW_REQUIRED');
+  });
+
+  it('rejects an invented exception code rather than fragmenting the queue', async () => {
+    const id = (await createMigration('exc-3')).json().id;
+    await app.inject({ method: 'POST', url: `/v1/migrations/${id}/authorize`, headers: auth() });
+    const tasks = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}/tasks`, headers: auth() })
+    ).json().data as { id: string; type: string }[];
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/migrations/${id}/actions`,
+      headers: auth(),
+      payload: {
+        action: 'block_task',
+        task_id: tasks.find((t) => t.type === 'OPEN_DESTINATION_PRODUCT')!.id,
+        code: 'the_bank_was_being_weird',
+        message: 'x',
+      },
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().field).toBe('code');
+  });
+
+  it('clears the blocked count when an operator resolves the case', async () => {
+    const id = (await createMigration('exc-4')).json().id;
+    const before = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}`, headers: auth() })
+    ).json();
+    expect(before.blocking_exceptions).toBe(1);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/v1/exceptions/${await firstBlockingId()}/resolve`,
+      headers: auth(),
+      payload: { note: 'LEP stays at the origin; customer informed' },
+    });
+    expect(res.json().blocking_remaining).toBe(0);
+
+    // The cached count on `migrations` is what the portfolio view reads. Left
+    // stale, the dashboard reports a migration blocked forever after the case
+    // has been closed.
+    const after = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}`, headers: auth() })
+    ).json();
+    expect(after.blocking_exceptions).toBe(0);
+
+    const stats = (
+      await app.inject({ method: 'GET', url: '/v1/portfolio/stats', headers: auth() })
+    ).json();
+    expect(stats.blocked).toBe(0);
+  });
+
+  it('reopens the task a resolved exception was blocking', async () => {
+    const id = (await createMigration('exc-5')).json().id;
+    await app.inject({ method: 'POST', url: `/v1/migrations/${id}/authorize`, headers: auth() });
+    const tasks = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}/tasks`, headers: auth() })
+    ).json().data as { id: string; type: string; itemId: string | null }[];
+    const target = tasks.find((t) => t.type === 'OPEN_DESTINATION_PRODUCT')!;
+
+    await app.inject({
+      method: 'POST',
+      url: `/v1/migrations/${id}/actions`,
+      headers: auth(),
+      payload: { action: 'block_task', task_id: target.id, code: 'MISSING_DOCUMENT', message: 'x' },
+    });
+
+    const open = (await app.inject({ method: 'GET', url: '/v1/exceptions', headers: auth() })).json()
+      .data as { id: string; code: string }[];
+    const runtime = open.find((e) => e.code === 'MISSING_DOCUMENT')!;
+
+    await app.inject({
+      method: 'POST',
+      url: `/v1/exceptions/${runtime.id}/resolve`,
+      headers: auth(),
+      payload: { note: 'document received' },
+    });
+
+    const after = (
+      await app.inject({ method: 'GET', url: `/v1/migrations/${id}/tasks`, headers: auth() })
+    ).json().data as { id: string; status: string }[];
+    // Closing the case without reopening the task is the worst of both: an
+    // empty queue and a migration that can never move.
+    expect(after.find((t) => t.id === target.id)!.status).not.toBe('BLOCKED');
+  });
+});

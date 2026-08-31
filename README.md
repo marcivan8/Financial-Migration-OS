@@ -17,7 +17,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 94 tests
+npm test                      # 99 tests
 ```
 
 ## What it does
@@ -256,7 +256,7 @@ only with an icon and a word, because green-vs-red fails colourblind separation
 selected set of steps for the dark surface, under both the OS media query and an
 explicit theme stamp.
 
-## Three bugs the build surfaced
+## Five bugs the build surfaced
 
 Worth recording, because two of them were invisible until the system ran at more
 than one migration:
@@ -275,6 +275,20 @@ than one migration:
 3. **Authorization was reported as execution.** A migration flipped to
    `IN_PROGRESS` the moment consent was captured, hiding the gap — often days —
    between a customer agreeing and the first institution actually moving.
+4. **A task blocked at execution never reached the operations queue.**
+   `blockTask` emitted an `ExceptionRaised` *event* but created no exception
+   *record*, so `GET /v1/exceptions` and the dashboard showed only planning-time
+   causes. The migration sat in `ACTION_REQUIRED` with nothing saying why — the
+   exact failure the exception engine exists to prevent. In the seeded demo that
+   hid every one of the 28 migrations awaiting action. Fixed by making
+   `blockTask` produce a first-class exception that the service persists, and by
+   giving execution-time causes their own vocabulary (`MISSING_DOCUMENT`,
+   `ORIGIN_UNRESPONSIVE`, `INVALID_IBAN`, …) that the API validates rather than
+   flattening to a generic code.
+5. **Resolving an exception left the portfolio reporting it blocked.**
+   `blockingExceptionCount` is a denormalised aggregate on `migrations`, set at
+   creation and never refreshed, so it drifted in both directions. Every path
+   that changes the exception set now recomputes it.
 
 ## Not built (deliberately)
 

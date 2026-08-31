@@ -1,13 +1,31 @@
 import type {
   MigrationEvent,
   MigrationEventType,
+  MigrationException,
   MigrationPlan,
   MigrationState,
   MigrationTask,
+  TaskActor,
   TaskStatus,
 } from '../domain/migration.js';
-import { ALLOWED_TRANSITIONS, TERMINAL_STATES } from '../domain/migration.js';
+import {
+  ALLOWED_TRANSITIONS,
+  TERMINAL_STATES,
+  isRuntimeExceptionCode,
+} from '../domain/migration.js';
 import { EXTERNAL_WAIT_TASKS, readyTasks } from '../planner/taskGraph.js';
+
+
+
+/** Who an operator has to talk to, in words rather than an enum. */
+const describeActor = (actor: TaskActor): string =>
+  ({
+    PLATFORM: 'the platform team',
+    ORIGIN_INSTITUTION: 'the origin institution',
+    DESTINATION_INSTITUTION: 'the destination institution',
+    CUSTOMER: 'the customer',
+    OPERATIONS: 'operations',
+  })[actor];
 
 /**
  * The migration state machine, backed by an append-only event log.
@@ -39,6 +57,8 @@ export class Migration {
   private sequence = 0;
   private _state: MigrationState = 'CREATED';
   private readonly _events: MigrationEvent[] = [];
+  private readonly _raisedExceptions: MigrationException[] = [];
+  private raisedCounter = 0;
   private readonly tasksById: Map<string, MigrationTask>;
 
   constructor(
@@ -224,16 +244,48 @@ export class Migration {
     return task;
   }
 
+  /**
+   * Block a task and raise a first-class exception for it.
+   *
+   * The exception object matters as much as the event. An event says a thing
+   * happened; an exception is a row in the operator's queue with a severity and
+   * a written next action. Emitting only the event left a migration sitting in
+   * ACTION_REQUIRED with nothing in the queue explaining why — the operator had
+   * no way to find it, which is precisely the failure the exception engine
+   * exists to prevent.
+   */
   blockTask(taskId: string, exceptionCode: string, message: string): MigrationTask {
     const task = this.setTaskStatus(taskId, 'BLOCKED');
     this.record('TaskBlocked', { taskId, type: task.type });
-    this.record('ExceptionRaised', { taskId, code: exceptionCode, message });
+
+    const exception: MigrationException = {
+      id: `${this.plan.migrationId}.exc_rt${String(++this.raisedCounter).padStart(3, '0')}`,
+      code: isRuntimeExceptionCode(exceptionCode) ? exceptionCode : 'MANUAL_REVIEW_REQUIRED',
+      severity: 'BLOCKING',
+      message,
+      subjectId: task.itemId,
+      resolution:
+        `Resolve with ${describeActor(task.actor)}, then reopen ${taskId} ` +
+        `("${task.label}"). The migration stays in ACTION_REQUIRED until it clears.`,
+    };
+    this._raisedExceptions.push(exception);
+    this.record('ExceptionRaised', {
+      taskId,
+      exceptionId: exception.id,
+      code: exceptionCode,
+      message,
+    });
     this.reconcileState(`${exceptionCode} on ${taskId}`);
     return task;
   }
 
+  /** Exceptions raised in this instance's lifetime, for the service to persist. */
+  get raisedExceptions(): readonly MigrationException[] {
+    return this._raisedExceptions;
+  }
+
   /** Clear a blocked task back to READY once operations has resolved the case. */
-  resolveException(taskId: string, note: string): MigrationTask {
+  clearBlock(taskId: string, note: string): MigrationTask {
     const task = this.setTaskStatus(taskId, 'READY');
     this.record('ExceptionResolved', { taskId, note });
     this.reconcileState(`exception on ${taskId} resolved`);
@@ -285,10 +337,19 @@ export class Migration {
    * UNIQUE (migration_id, sequence) constraint would reject the next write —
    * loudly, which is the correct failure, but it should never get that far.
    */
-  restore(state: MigrationState, tasks: MigrationTask[], lastSequence: number): void {
+  restore(
+    state: MigrationState,
+    tasks: MigrationTask[],
+    lastSequence: number,
+    raisedExceptionCount = 0,
+  ): void {
     this._state = state;
     this._events.length = 0;
+    this._raisedExceptions.length = 0;
     this.sequence = lastSequence;
+    // Continue the runtime-exception numbering where storage left off, so a
+    // second block on the same migration does not reuse an id.
+    this.raisedCounter = raisedExceptionCount;
     for (const task of tasks) {
       const existing = this.tasksById.get(task.id);
       if (existing) existing.status = task.status;

@@ -189,9 +189,12 @@ export class MigrationService {
 
     const events = await this.store.listEvents(ctx, migrationId);
     const lastSequence = events.length === 0 ? 0 : events[events.length - 1]!.sequence;
+    const runtimeExceptions = (
+      await this.store.listExceptions(ctx, { migrationId })
+    ).filter((e) => e.id.includes('.exc_rt')).length;
 
     const migration = new Migration(planWithStatus, this.clock);
-    migration.restore(record.state, planWithStatus.tasks, lastSequence);
+    migration.restore(record.state, planWithStatus.tasks, lastSequence, runtimeExceptions);
     return migration;
   }
 
@@ -284,6 +287,7 @@ export class MigrationService {
     }
 
     await this.persist(ctx, migration, plan);
+    await this.refreshBlockedCount(ctx, migrationId);
     const completion = computeCompletion(plan, migration).overall;
     await this.store.updateMigration(ctx, migrationId, {
       state: migration.state,
@@ -326,6 +330,7 @@ export class MigrationService {
     }
 
     await this.persist(ctx, migration, plan);
+    await this.refreshBlockedCount(ctx, migrationId);
     const completion = computeCompletion(plan, migration).overall;
     await this.store.updateMigration(ctx, migrationId, {
       state: migration.state,
@@ -357,8 +362,78 @@ export class MigrationService {
     for (const task of migration.tasks) {
       await this.store.updateTask(ctx, task);
     }
+    // Exceptions raised while executing are rows in the operator's queue, not
+    // just entries in the event log. Without this a blocked task left the
+    // migration in ACTION_REQUIRED with nothing on the dashboard saying why.
+    for (const exception of migration.raisedExceptions) {
+      await this.store.putException(ctx, plan.migrationId, exception);
+    }
     for (const event of fresh) {
       await this.webhooks.publish(ctx, event);
     }
+  }
+
+  /**
+   * Recompute the denormalised blocked count from the open exceptions.
+   *
+   * It is a cached aggregate on `migrations`, kept for dashboard queries over
+   * hundreds of thousands of rows. Set once at creation and never refreshed, it
+   * drifts in both directions: an operator resolves a case and the portfolio
+   * still reports the migration blocked, and a runtime block never shows up at
+   * all. Anything that changes the exception set has to come through here.
+   */
+  private async refreshBlockedCount(
+    ctx: TenantContext,
+    migrationId: string,
+  ): Promise<number> {
+    const open = await this.store.listExceptions(ctx, { migrationId, openOnly: true });
+    const blocking = open.filter((e) => e.severity === 'BLOCKING').length;
+    await this.store.updateMigration(ctx, migrationId, {
+      blockingExceptionCount: blocking,
+    });
+    return blocking;
+  }
+
+  /**
+   * Resolve an exception and, when it was blocking a task, put that task back
+   * in play. Resolving the case without reopening the task would leave the
+   * migration permanently stuck with an empty queue — the worst of both.
+   */
+  async resolveException(
+    ctx: TenantContext,
+    exceptionId: string,
+    by: string,
+    note: string,
+  ): Promise<{ migrationId: string; state: MigrationState; blockingRemaining: number }> {
+    const all = await this.store.listExceptions(ctx, { openOnly: true });
+    const exception = all.find((e) => e.id === exceptionId);
+    if (!exception) throw new NotFoundError('exception', exceptionId);
+
+    await this.store.resolveException(ctx, exceptionId, by, note);
+
+    const migration = await this.rehydrate(ctx, exception.migrationId);
+    const plan = await this.store.getPlan(ctx, exception.migrationId);
+    if (!plan) throw new NotFoundError('migration', exception.migrationId);
+
+    // A runtime exception names the task it blocked in its id's sibling: find
+    // any blocked task belonging to this exception's subject and reopen it.
+    const blocked = migration.tasks.filter((t) => t.status === 'BLOCKED');
+    for (const task of blocked) {
+      if (exception.subjectId === null || task.itemId === exception.subjectId) {
+        migration.clearBlock(task.id, note);
+      }
+    }
+
+    await this.persist(ctx, migration, plan);
+    const blockingRemaining = await this.refreshBlockedCount(ctx, exception.migrationId);
+    await this.store.updateMigration(ctx, exception.migrationId, {
+      state: migration.state,
+    });
+
+    return {
+      migrationId: exception.migrationId,
+      state: migration.state,
+      blockingRemaining,
+    };
   }
 }
