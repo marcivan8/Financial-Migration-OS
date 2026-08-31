@@ -84,6 +84,26 @@ export interface BatchOptions {
   onProgress?: (done: number, total: number) => void;
 }
 
+/** A customer + its rows, ready for `store.importCustomers` — see `persistChunked`. */
+interface PreparedImportRow {
+  externalRef: string;
+  customerId: string;
+  customer: Customer;
+  products: FinancialProduct[];
+  recurringPayments: RecurringPayment[];
+}
+
+/**
+ * Customers per `store.importCustomers` call. Large enough that a 500,000-row
+ * import spends its time on the database, not the round trip to reach it;
+ * small enough to stay well under Postgres' ~65,535 bound-parameter limit
+ * even for a chunk of unusually product-heavy customers (200 customers × a
+ * generous 10 products each × `financial_products`' 13 columns is ~26,000).
+ * The same ceiling `planBatch` already uses for concurrency — not a
+ * coincidence, both exist to bound how much one round trip is asked to do.
+ */
+const IMPORT_CHUNK_SIZE = 200;
+
 export class BatchPipeline {
   constructor(
     private readonly store: MigrationStore,
@@ -155,9 +175,55 @@ export class BatchPipeline {
   }
 
   /**
+   * Persist prepared rows in chunks of `IMPORT_CHUNK_SIZE`, batching the
+   * writes across customers via `store.importCustomers` — one round trip per
+   * chunk instead of one (Postgres: three) per customer. That is the whole
+   * point, and it has a real cost: `store.importCustomers` runs a chunk in a
+   * single transaction, so a customer whose data the database itself rejects
+   * (not something the in-app validation above already catches — a malformed
+   * date of birth, say) would otherwise take the rest of its chunk down with
+   * it.
+   *
+   * The fix is not a second, more careful write path — it's retrying the
+   * exact same call with a batch of one for every customer in a chunk that
+   * failed. That is slow only for the chunk that actually had a problem, and
+   * it is the same code, so there is no separate "careful" path to keep in
+   * sync with the fast one. This is what gets back the per-customer failure
+   * isolation `importRows` has always guaranteed, at the cost of one retry
+   * pass only on the (expected to be rare) chunk that needs it.
+   */
+  private async persistChunked(
+    ctx: TenantContext,
+    prepared: PreparedImportRow[],
+  ): Promise<{ succeeded: Set<string>; failed: Map<string, string> }> {
+    const succeeded = new Set<string>();
+    const failed = new Map<string, string>();
+
+    for (let i = 0; i < prepared.length; i += IMPORT_CHUNK_SIZE) {
+      const chunk = prepared.slice(i, i + IMPORT_CHUNK_SIZE);
+      try {
+        await this.store.importCustomers(ctx, chunk);
+        for (const row of chunk) succeeded.add(row.customerId);
+      } catch {
+        for (const row of chunk) {
+          try {
+            await this.store.importCustomers(ctx, [row]);
+            succeeded.add(row.customerId);
+          } catch (err) {
+            failed.set(row.customerId, err instanceof Error ? err.message : String(err));
+          }
+        }
+      }
+    }
+
+    return { succeeded, failed };
+  }
+
+  /**
    * Import a population. A row that cannot be materialised is recorded as a
    * failure and skipped — never thrown, because one malformed record in a
-   * 500,000-row file must not abort the other 499,999.
+   * 500,000-row file must not abort the other 499,999. See `persistChunked`
+   * for how that guarantee survives batching the writes across customers.
    */
   async importRows(
     ctx: TenantContext,
@@ -167,7 +233,7 @@ export class BatchPipeline {
     const batch = await this.store.getBatch(ctx, batchId);
     if (!batch) throw new ValidationError(`Unknown batch ${batchId}`, 'batch_id');
 
-    const imported: string[] = [];
+    const prepared: PreparedImportRow[] = [];
     const failures: BatchFailure[] = [];
 
     for (const row of rows) {
@@ -179,35 +245,41 @@ export class BatchPipeline {
         }
 
         const customer = this.newCustomer(ctx, batch.originInstitutionId, customerId, row);
-        await this.store.putCustomer(ctx, customer);
+        const products = row.products.map((p, i) => ({
+          ...p,
+          id: `${customerId}_p${i}`,
+          accountId: `${customerId}_a${i}`,
+          customerId,
+          institutionId: batch.originInstitutionId,
+        }));
+        const recurringPayments = (row.recurringPayments ?? []).map((p, i) => ({
+          ...p,
+          id: `${customerId}_r${i}`,
+          accountId: `${customerId}_a0`,
+          customerId,
+        }));
 
-        await this.store.putProducts(
-          ctx,
-          row.products.map((p, i) => ({
-            ...p,
-            id: `${customerId}_p${i}`,
-            accountId: `${customerId}_a${i}`,
-            customerId,
-            institutionId: batch.originInstitutionId,
-          })),
-        );
-
-        await this.store.putRecurringPayments(
-          ctx,
-          (row.recurringPayments ?? []).map((p, i) => ({
-            ...p,
-            id: `${customerId}_r${i}`,
-            accountId: `${customerId}_a0`,
-            customerId,
-          })),
-        );
-
-        imported.push(customerId);
+        prepared.push({ externalRef: row.externalRef, customerId, customer, products, recurringPayments });
       } catch (err) {
         failures.push({
           externalRef: row.externalRef,
           customerId: null,
           reason: err instanceof Error ? err.message : String(err),
+          stage: 'IMPORT',
+        });
+      }
+    }
+
+    const { succeeded, failed } = await this.persistChunked(ctx, prepared);
+    const imported: string[] = [];
+    for (const row of prepared) {
+      if (succeeded.has(row.customerId)) {
+        imported.push(row.customerId);
+      } else {
+        failures.push({
+          externalRef: row.externalRef,
+          customerId: null,
+          reason: failed.get(row.customerId) ?? 'import failed',
           stage: 'IMPORT',
         });
       }
@@ -243,9 +315,8 @@ export class BatchPipeline {
     const batch = await this.store.getBatch(ctx, batchId);
     if (!batch) throw new ValidationError(`Unknown batch ${batchId}`, 'batch_id');
 
-    const imported: string[] = [];
+    const prepared: (PreparedImportRow & { skipped: SkippedAccount[] })[] = [];
     const failures: BatchFailure[] = [];
-    const skippedAccounts: ProviderImportResult['skippedAccounts'] = [];
 
     for (const row of rows) {
       try {
@@ -266,22 +337,42 @@ export class BatchPipeline {
         }
 
         const customer = this.newCustomer(ctx, batch.originInstitutionId, customerId, row);
-        await this.store.putCustomer(ctx, customer);
-        await this.store.putProducts(ctx, products);
         // Recurring payments aren't part of this path: no connectivity
         // provider here detects them (Powens doesn't — see README Milestone
         // 4). A row that wants recurring payments imported still goes
         // through importRows.
-
-        imported.push(customerId);
-        for (const s of skipped) {
-          skippedAccounts.push({ ...s, customerId, externalRef: row.externalRef });
-        }
+        prepared.push({
+          externalRef: row.externalRef,
+          customerId,
+          customer,
+          products,
+          recurringPayments: [],
+          skipped,
+        });
       } catch (err) {
         failures.push({
           externalRef: row.externalRef,
           customerId: null,
           reason: err instanceof Error ? err.message : String(err),
+          stage: 'IMPORT',
+        });
+      }
+    }
+
+    const { succeeded, failed } = await this.persistChunked(ctx, prepared);
+    const imported: string[] = [];
+    const skippedAccounts: ProviderImportResult['skippedAccounts'] = [];
+    for (const row of prepared) {
+      if (succeeded.has(row.customerId)) {
+        imported.push(row.customerId);
+        for (const s of row.skipped) {
+          skippedAccounts.push({ ...s, customerId: row.customerId, externalRef: row.externalRef });
+        }
+      } else {
+        failures.push({
+          externalRef: row.externalRef,
+          customerId: null,
+          reason: failed.get(row.customerId) ?? 'import failed',
           stage: 'IMPORT',
         });
       }

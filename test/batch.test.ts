@@ -4,7 +4,7 @@ import type { SeedResult } from '../src/api/bootstrap.js';
 import type { TenantContext } from '../src/store/types.js';
 import type { ImportRow, ProviderImportRow } from '../src/batch/pipeline.js';
 import { money } from '../src/domain/types.js';
-import { freshStore, closeTestStore } from './testStore.js';
+import { freshStore, closeTestStore, usingPostgres } from './testStore.js';
 import { PowensProvider } from '../src/connectivity/powens.js';
 import { POWENS_SAMPLE_ACCOUNTS } from '../src/connectivity/fixtures/powens-sample.js';
 import { POWENS_SAMPLE_TRANSACTIONS } from '../src/connectivity/fixtures/powens-transactions-sample.js';
@@ -87,6 +87,29 @@ describe('bulk import', () => {
     expect(result.failures[0]!.externalRef).toBe('EXT-2');
     expect(result.failures[0]!.stage).toBe('IMPORT');
   });
+
+  // The test above proves isolation for a row the in-app check already
+  // catches (an empty products[]) — it never reaches the database, so it
+  // never exercises persistChunked's fallback. This one forces a failure
+  // only the database can catch (date_of_birth is a real DATE column, and
+  // nothing upstream validates the string is a real date), inside a chunk
+  // with otherwise-good rows, to prove the chunk-transaction-fails-so-retry-
+  // one-at-a-time path actually isolates the bad row rather than just
+  // rejecting the whole chunk. In-memory has no DATE column to reject it, so
+  // this only means something against Postgres.
+  it.skipIf(!usingPostgres)(
+    'isolates a row the database rejects, not just one the app already caught',
+    async () => {
+      const batch = await newBatch();
+      const rows = [row(1), row(2), row(3, { dateOfBirth: 'not-a-real-date' }), row(4), row(5)];
+      const result = await w.batches.importRows(ctx, batch.id, rows);
+
+      expect(result.imported).toHaveLength(4);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0]!.externalRef).toBe('EXT-3');
+      expect(result.failures[0]!.reason).toMatch(/date/i);
+    },
+  );
 });
 
 describe('provider import (Powens)', () => {

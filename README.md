@@ -1,11 +1,13 @@
 # Financial Migration OS — engine + enterprise API
 
-Milestones 1 through 5 of the build brief: a deterministic migration engine, the
+Milestones 1 through 6 of the build brief: a deterministic migration engine, the
 multi-tenant API, webhooks, batch pipeline and operations dashboard around it, a
 Postgres adapter behind the same storage port the in-memory store uses, a
-connectivity abstraction with its first provider mapping (Powens), and a
+connectivity abstraction with its first provider mapping (Powens), a
 recurring-payment detector that turns raw transaction history into the
-`RecurringPayment[]` the planner has consumed since Milestone 1.
+`RecurringPayment[]` the planner has consumed since Milestone 1, and batching
+that adapter's customer writes across an entire batch import, not just within
+one customer.
 
 ## Milestone 1 — Migration Engine
 
@@ -21,7 +23,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 127 tests, in-memory store by default
+npm test                      # 127 tests, in-memory store by default (128 against Postgres — one test is Postgres-only)
 ```
 
 Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
@@ -274,7 +276,7 @@ explicit theme stamp.
 
 ```bash
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run db:migrate  # once
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 127 tests, real Postgres
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 127 tests plus 1 Postgres-only, real Postgres
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run serve       # data survives a restart
 ```
 
@@ -325,10 +327,10 @@ the same batch — every plan item, task and exception was its own network
 round trip inside the migration's transaction. Batching each table into one
 multi-row `INSERT` per migration (`valuesPlaceholders` in `postgres.ts`) cut
 that to ~7s. What's left is mostly per-migration transaction overhead (`BEGIN`
-/ role switch / `set_config` / `COMMIT`, 500 times over 25-way concurrency) —
-batching *across* customers, not just within one, would be the next cut, and
-isn't free: it means a failure in customer 214 can no longer be isolated from
-customer 213 by a transaction boundary the way `importRows` promises today.
+/ role switch / `set_config` / `COMMIT`, 500 times over 25-way concurrency) in
+`planBatch`'s `createMigration` calls — a separate cost from customer import,
+and still open; see Milestone 6 for the import side of "batch across
+customers, not just within one."
 
 Local setup used for the above (`fmos_worker` is created by the migration
 itself):
@@ -550,6 +552,56 @@ Netflix subscription alongside its hand-authored recurring payments with no
 special-casing, plus the 422s for an unknown provider and an unknown
 customer.
 
+## Milestone 6 — batching customer writes across a batch
+
+```bash
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test   # 128 tests — 1 is Postgres-only, see below
+```
+
+The deferred half of Milestone 3's throughput work: `importRows` and
+`importFromProvider` called `store.putCustomer` / `putProducts` /
+`putRecurringPayments` once per customer — three transactions each (Postgres:
+`BEGIN` / role switch / `set_config` / three-or-so `COMMIT`s), the same
+per-row-not-per-batch cost `putProducts` and `putRecurringPayments` themselves
+used to have before Milestone 3 batched *within* one customer's rows. For 500
+customers that's roughly 1,500 round trips before a single migration gets
+planned.
+
+**`MigrationStore` gained `importCustomers`** — one call, one transaction,
+four multi-row `INSERT`s (customers, consents, products, recurring payments),
+however many customers are in it. `PostgresStore`'s three-tables-worth of
+per-row-building logic was split into private `insert*Rows` helpers so
+`putCustomer` / `putProducts` / `putRecurringPayments` and `importCustomers`
+share one implementation each rather than two copies to keep in sync.
+Measured directly against the same schema, same store instance, 500
+customers with two products and one recurring payment each: **~2.15s calling
+the old one-customer-at-a-time methods, ~0.13s calling `importCustomers` in
+chunks of 200 — about 16x.** (This is the import step in isolation, not the
+`planBatch` scale test's total time, which also spends most of its time in
+`createMigration` — untouched by this round; see Milestone 3's throughput
+note, updated above.)
+
+**The tradeoff this makes, paid back.** Batching across customers means a
+database-level failure partway through a chunk rolls back everyone in that
+chunk, not just the customer who caused it — the cost this work was
+deliberately deferred over in Milestone 3. `BatchPipeline.persistChunked`
+gets the old guarantee back cheaply: try the chunk as one call, and only on
+failure retry it one customer at a time (the exact same `importCustomers`
+call, batch size one, so there is no separate "careful" code path to drift
+out of sync with the fast one). That retry pass only runs on the chunk that
+actually had a problem — the common all-succeeds case never pays for it.
+
+**Proven against a failure the app-level validation can't catch, not just
+one it can.** The existing "one bad row doesn't stop the batch" test uses an
+empty `products[]` — caught before anything reaches the database, so it
+never touched `persistChunked`'s retry path. `date_of_birth` is a real
+`DATE NOT NULL` column and nothing upstream validates the string is a real
+date; `test/batch.test.ts`'s new Postgres-only test (`it.skipIf(!usingPostgres)`)
+plants one malformed date of birth inside a chunk of otherwise-good rows and
+checks that exactly that customer fails while the rest of the chunk still
+imports — a case the in-memory store can't exercise at all (no `DATE` column
+to reject it), which is why the test is guarded rather than universal.
+
 ## Not built (deliberately)
 
 **No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
@@ -567,9 +619,9 @@ from §15 consumes this output; none of it belongs in the decision path.
    recurrence signal) against a live sandbox, and recalibrate the
    detector's thresholds against real transaction data rather than
    hand-built fixtures once that's possible.
-2. If the remaining ~7s on a 500-customer Postgres plan matters at real
-   volume: batch *across* customers, not just within one — deliberately not
-   done yet, because it trades away the per-customer transaction isolation
-   `importRows` currently gives failure handling.
+2. `planBatch`'s `createMigration` calls are still one transaction per
+   customer (Milestone 6 only batched customer *import*, not planning) — the
+   same batch-across-customers tradeoff applies there if the remaining
+   per-migration transaction overhead matters at real volume.
 3. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.

@@ -157,6 +157,28 @@ export interface MigrationStore {
   listProducts(ctx: TenantContext, customerId: string): Promise<FinancialProduct[]>;
   putRecurringPayments(ctx: TenantContext, payments: RecurringPayment[]): Promise<void>;
   listRecurringPayments(ctx: TenantContext, customerId: string): Promise<RecurringPayment[]>;
+  /**
+   * Import several customers (each with its products and recurring
+   * payments) as one unit. On the Postgres adapter this is one transaction
+   * and four multi-row `INSERT`s regardless of how many customers are in
+   * the batch — the round-trip reduction `putCustomer`/`putProducts`/
+   * `putRecurringPayments` can't give when called once per customer.
+   *
+   * That efficiency has a cost: a failure partway through means every
+   * customer in the call is rolled back together, not just the one that
+   * caused it. `BatchPipeline` is the caller that cares about per-customer
+   * isolation, and it gets it back cheaply — retry the same call with a
+   * batch of one for whichever customers were in a batch that failed. See
+   * `batch/pipeline.ts`'s `persistChunked`.
+   */
+  importCustomers(
+    ctx: TenantContext,
+    rows: {
+      customer: Customer;
+      products: FinancialProduct[];
+      recurringPayments: RecurringPayment[];
+    }[],
+  ): Promise<void>;
 
   // -- migrations -----------------------------------------------------------
   createMigration(

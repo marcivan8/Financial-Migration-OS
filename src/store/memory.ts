@@ -123,6 +123,28 @@ export class InMemoryStore implements MigrationStore {
     return this.mine(ctx, this.payments.values()).filter((p) => p.customerId === customerId);
   }
 
+  /**
+   * No round trips to save and nothing to roll back in memory, so this is
+   * just the three single-row/array puts run in sequence — the batching win
+   * `PostgresStore.importCustomers` gives is a real-network-hop concern this
+   * store doesn't have. What matters for parity is that both adapters accept
+   * the same call and leave the same data behind.
+   */
+  async importCustomers(
+    ctx: TenantContext,
+    rows: {
+      customer: Customer;
+      products: FinancialProduct[];
+      recurringPayments: RecurringPayment[];
+    }[],
+  ): Promise<void> {
+    for (const row of rows) {
+      await this.putCustomer(ctx, row.customer);
+      await this.putProducts(ctx, row.products);
+      await this.putRecurringPayments(ctx, row.recurringPayments);
+    }
+  }
+
   // -- migrations -----------------------------------------------------------
 
   async createMigration(

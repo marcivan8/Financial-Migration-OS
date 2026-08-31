@@ -224,47 +224,82 @@ export class PostgresStore implements MigrationStore {
 
   // -- customers ----------------------------------------------------------------
 
+  /**
+   * The row-building guts of `putCustomer`, factored out so `importCustomers`
+   * can insert many customers' rows in one statement inside one shared
+   * transaction instead of calling `putCustomer` N times (N transactions).
+   * `c` is a client already inside a transaction — this never opens its own.
+   */
+  private async insertCustomerRows(
+    c: PoolClient,
+    ctx: TenantContext,
+    customers: Customer[],
+  ): Promise<void> {
+    if (customers.length === 0) return;
+    const COLS = 9;
+    const params: unknown[] = [];
+    for (const customer of customers) {
+      params.push(
+        customer.id,
+        ctx.tenantId,
+        customer.institutionId,
+        customer.identity.firstName,
+        customer.identity.lastName,
+        customer.identity.dateOfBirth,
+        customer.identity.countryOfResidence,
+        customer.identity.fiscalResidence,
+        customer.migrationIds,
+      );
+    }
+    await c.query(
+      `INSERT INTO customers
+         (id, tenant_id, institution_id, first_name, last_name, date_of_birth,
+          country_of_residence, fiscal_residence, migration_ids)
+       VALUES ${valuesPlaceholders(customers.length, COLS)}
+       ON CONFLICT (id) DO UPDATE SET
+         institution_id = EXCLUDED.institution_id, first_name = EXCLUDED.first_name,
+         last_name = EXCLUDED.last_name, date_of_birth = EXCLUDED.date_of_birth,
+         country_of_residence = EXCLUDED.country_of_residence,
+         fiscal_residence = EXCLUDED.fiscal_residence, migration_ids = EXCLUDED.migration_ids`,
+      params,
+    );
+  }
+
+  /** The consent-row counterpart to `insertCustomerRows` — see that method's comment. */
+  private async insertConsentRows(
+    c: PoolClient,
+    ctx: TenantContext,
+    customers: Customer[],
+  ): Promise<void> {
+    if (customers.length === 0) return;
+    const COLS = 7;
+    const params: unknown[] = [];
+    for (const customer of customers) {
+      params.push(
+        customer.consent.id,
+        ctx.tenantId,
+        customer.id,
+        customer.consent.scopes,
+        customer.consent.grantedAt,
+        customer.consent.expiresAt,
+        customer.consent.revokedAt ?? null,
+      );
+    }
+    await c.query(
+      `INSERT INTO consents (id, tenant_id, customer_id, scopes, granted_at, expires_at, revoked_at)
+       VALUES ${valuesPlaceholders(customers.length, COLS)}
+       ON CONFLICT (id) DO UPDATE SET
+         scopes = EXCLUDED.scopes, granted_at = EXCLUDED.granted_at,
+         expires_at = EXCLUDED.expires_at, revoked_at = EXCLUDED.revoked_at`,
+      params,
+    );
+  }
+
   async putCustomer(ctx: TenantContext, customer: Customer): Promise<void> {
     await this.tx(ctx, async (c) => {
       await this.ensureTenant(c, ctx.tenantId);
-      await c.query(
-        `INSERT INTO customers
-           (id, tenant_id, institution_id, first_name, last_name, date_of_birth,
-            country_of_residence, fiscal_residence, migration_ids)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (id) DO UPDATE SET
-           institution_id = EXCLUDED.institution_id, first_name = EXCLUDED.first_name,
-           last_name = EXCLUDED.last_name, date_of_birth = EXCLUDED.date_of_birth,
-           country_of_residence = EXCLUDED.country_of_residence,
-           fiscal_residence = EXCLUDED.fiscal_residence, migration_ids = EXCLUDED.migration_ids`,
-        [
-          customer.id,
-          ctx.tenantId,
-          customer.institutionId,
-          customer.identity.firstName,
-          customer.identity.lastName,
-          customer.identity.dateOfBirth,
-          customer.identity.countryOfResidence,
-          customer.identity.fiscalResidence,
-          customer.migrationIds,
-        ],
-      );
-      await c.query(
-        `INSERT INTO consents (id, tenant_id, customer_id, scopes, granted_at, expires_at, revoked_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (id) DO UPDATE SET
-           scopes = EXCLUDED.scopes, granted_at = EXCLUDED.granted_at,
-           expires_at = EXCLUDED.expires_at, revoked_at = EXCLUDED.revoked_at`,
-        [
-          customer.consent.id,
-          ctx.tenantId,
-          customer.id,
-          customer.consent.scopes,
-          customer.consent.grantedAt,
-          customer.consent.expiresAt,
-          customer.consent.revokedAt ?? null,
-        ],
-      );
+      await this.insertCustomerRows(c, ctx, [customer]);
+      await this.insertConsentRows(c, ctx, [customer]);
     });
   }
 
@@ -286,42 +321,50 @@ export class PostgresStore implements MigrationStore {
     });
   }
 
-  async putProducts(ctx: TenantContext, products: FinancialProduct[]): Promise<void> {
+  /** The row-building guts of `putProducts` — see `insertCustomerRows`'s comment for why this is split out. */
+  private async insertProductRows(
+    c: PoolClient,
+    ctx: TenantContext,
+    products: FinancialProduct[],
+  ): Promise<void> {
     if (products.length === 0) return;
     const COLS = 13;
-    await this.tx(ctx, async (c) => {
-      const params: unknown[] = [];
-      for (const p of products) {
-        params.push(
-          p.id,
-          ctx.tenantId,
-          p.customerId,
-          p.institutionId,
-          p.accountId,
-          p.type,
-          p.rawLabel,
-          p.balance.amount,
-          p.balance.currency,
-          p.openedAt,
-          JSON.stringify({ ...p.metadata, transferable: p.transferable }),
-          p.sourceProvider ?? null,
-          p.sourceFetchedAt ?? null,
-        );
-      }
-      await c.query(
-        `INSERT INTO financial_products
-           (id, tenant_id, customer_id, institution_id, account_id, type, raw_label,
-            balance_minor, currency, opened_at, metadata, source_provider, source_fetched_at)
-         VALUES ${valuesPlaceholders(products.length, COLS)}
-         ON CONFLICT (id) DO UPDATE SET
-           account_id = EXCLUDED.account_id, type = EXCLUDED.type,
-           raw_label = EXCLUDED.raw_label, balance_minor = EXCLUDED.balance_minor,
-           currency = EXCLUDED.currency, opened_at = EXCLUDED.opened_at,
-           metadata = EXCLUDED.metadata, source_provider = EXCLUDED.source_provider,
-           source_fetched_at = EXCLUDED.source_fetched_at`,
-        params,
+    const params: unknown[] = [];
+    for (const p of products) {
+      params.push(
+        p.id,
+        ctx.tenantId,
+        p.customerId,
+        p.institutionId,
+        p.accountId,
+        p.type,
+        p.rawLabel,
+        p.balance.amount,
+        p.balance.currency,
+        p.openedAt,
+        JSON.stringify({ ...p.metadata, transferable: p.transferable }),
+        p.sourceProvider ?? null,
+        p.sourceFetchedAt ?? null,
       );
-    });
+    }
+    await c.query(
+      `INSERT INTO financial_products
+         (id, tenant_id, customer_id, institution_id, account_id, type, raw_label,
+          balance_minor, currency, opened_at, metadata, source_provider, source_fetched_at)
+       VALUES ${valuesPlaceholders(products.length, COLS)}
+       ON CONFLICT (id) DO UPDATE SET
+         account_id = EXCLUDED.account_id, type = EXCLUDED.type,
+         raw_label = EXCLUDED.raw_label, balance_minor = EXCLUDED.balance_minor,
+         currency = EXCLUDED.currency, opened_at = EXCLUDED.opened_at,
+         metadata = EXCLUDED.metadata, source_provider = EXCLUDED.source_provider,
+         source_fetched_at = EXCLUDED.source_fetched_at`,
+      params,
+    );
+  }
+
+  async putProducts(ctx: TenantContext, products: FinancialProduct[]): Promise<void> {
+    if (products.length === 0) return;
+    await this.tx(ctx, (c) => this.insertProductRows(c, ctx, products));
   }
 
   async listProducts(ctx: TenantContext, customerId: string): Promise<FinancialProduct[]> {
@@ -335,40 +378,48 @@ export class PostgresStore implements MigrationStore {
     });
   }
 
-  async putRecurringPayments(ctx: TenantContext, payments: RecurringPayment[]): Promise<void> {
+  /** The row-building guts of `putRecurringPayments` — see `insertCustomerRows`'s comment for why this is split out. */
+  private async insertRecurringPaymentRows(
+    c: PoolClient,
+    ctx: TenantContext,
+    payments: RecurringPayment[],
+  ): Promise<void> {
     if (payments.length === 0) return;
     const COLS = 12;
-    await this.tx(ctx, async (c) => {
-      const params: unknown[] = [];
-      for (const p of payments) {
-        params.push(
-          p.id,
-          ctx.tenantId,
-          p.customerId,
-          p.accountId,
-          p.merchant,
-          p.amount.amount,
-          p.amount.currency,
-          p.frequency,
-          p.category,
-          p.direction,
-          p.confidence,
-          p.migrationStatus,
-        );
-      }
-      await c.query(
-        `INSERT INTO recurring_payments
-           (id, tenant_id, customer_id, account_id, merchant, amount_minor, currency,
-            frequency, category, direction, confidence, migration_status)
-         VALUES ${valuesPlaceholders(payments.length, COLS)}
-         ON CONFLICT (id) DO UPDATE SET
-           merchant = EXCLUDED.merchant, amount_minor = EXCLUDED.amount_minor,
-           currency = EXCLUDED.currency, frequency = EXCLUDED.frequency,
-           category = EXCLUDED.category, direction = EXCLUDED.direction,
-           confidence = EXCLUDED.confidence, migration_status = EXCLUDED.migration_status`,
-        params,
+    const params: unknown[] = [];
+    for (const p of payments) {
+      params.push(
+        p.id,
+        ctx.tenantId,
+        p.customerId,
+        p.accountId,
+        p.merchant,
+        p.amount.amount,
+        p.amount.currency,
+        p.frequency,
+        p.category,
+        p.direction,
+        p.confidence,
+        p.migrationStatus,
       );
-    });
+    }
+    await c.query(
+      `INSERT INTO recurring_payments
+         (id, tenant_id, customer_id, account_id, merchant, amount_minor, currency,
+          frequency, category, direction, confidence, migration_status)
+       VALUES ${valuesPlaceholders(payments.length, COLS)}
+       ON CONFLICT (id) DO UPDATE SET
+         merchant = EXCLUDED.merchant, amount_minor = EXCLUDED.amount_minor,
+         currency = EXCLUDED.currency, frequency = EXCLUDED.frequency,
+         category = EXCLUDED.category, direction = EXCLUDED.direction,
+         confidence = EXCLUDED.confidence, migration_status = EXCLUDED.migration_status`,
+      params,
+    );
+  }
+
+  async putRecurringPayments(ctx: TenantContext, payments: RecurringPayment[]): Promise<void> {
+    if (payments.length === 0) return;
+    await this.tx(ctx, (c) => this.insertRecurringPaymentRows(c, ctx, payments));
   }
 
   async listRecurringPayments(
@@ -381,6 +432,41 @@ export class PostgresStore implements MigrationStore {
         [customerId],
       );
       return rows.map(rowToPayment);
+    });
+  }
+
+  /**
+   * Import many customers — each with its products and recurring payments —
+   * as one transaction and (at most) four multi-row `INSERT`s, regardless of
+   * how many customers are in `rows`. See this method's doc on the
+   * `MigrationStore` interface for the failure-isolation tradeoff this makes,
+   * and `batch/pipeline.ts`'s `persistChunked` for how the caller gets that
+   * isolation back.
+   */
+  async importCustomers(
+    ctx: TenantContext,
+    rows: {
+      customer: Customer;
+      products: FinancialProduct[];
+      recurringPayments: RecurringPayment[];
+    }[],
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    await this.tx(ctx, async (c) => {
+      await this.ensureTenant(c, ctx.tenantId);
+      const customers = rows.map((r) => r.customer);
+      await this.insertCustomerRows(c, ctx, customers);
+      await this.insertConsentRows(c, ctx, customers);
+      await this.insertProductRows(
+        c,
+        ctx,
+        rows.flatMap((r) => r.products),
+      );
+      await this.insertRecurringPaymentRows(
+        c,
+        ctx,
+        rows.flatMap((r) => r.recurringPayments),
+      );
     });
   }
 
