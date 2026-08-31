@@ -11,10 +11,12 @@
 import { wire, seedTenant, buildServer } from './api/bootstrap.js';
 import { seedPopulation } from './batch/demo.js';
 import { PostgresStore } from './store/postgres.js';
+import { createDrainQueue, type DrainQueueHandle } from './webhooks/queue.js';
 
 const PORT = Number(process.env['PORT'] ?? 8080);
 const POPULATE = process.argv.includes('--populate');
 const DATABASE_URL = process.env['DATABASE_URL'];
+const REDIS_URL = process.env['REDIS_URL'];
 
 const store = DATABASE_URL ? PostgresStore.connect(DATABASE_URL) : undefined;
 if (DATABASE_URL) {
@@ -39,13 +41,26 @@ if (POPULATE) {
 
 const app = buildServer(w);
 
-// Drain webhook deliveries on a timer, standing in for the BullMQ worker.
-const drainTimer = setInterval(() => {
-  void w.webhooks.drain().catch(() => undefined);
-}, 2_000);
+// Drain webhook deliveries. REDIS_URL set: a durable BullMQ schedule that
+// survives this process restarting (see webhooks/queue.ts). Unset: the
+// same setInterval this project always used to stand in for it — still the
+// default so `npm run serve` with no other setup stays a demo, not an
+// infra checklist.
+let drainTimer: NodeJS.Timeout | undefined;
+let drainQueue: DrainQueueHandle | undefined;
+if (REDIS_URL) {
+  console.log(`Using Redis (${new URL(REDIS_URL).host}) for a durable webhook-drain schedule.`);
+  drainQueue = createDrainQueue(REDIS_URL, w.webhooks);
+} else {
+  console.log('REDIS_URL not set — draining webhooks on an in-process timer (see README Milestone 7).');
+  drainTimer = setInterval(() => {
+    void w.webhooks.drain().catch(() => undefined);
+  }, 2_000);
+}
 
 const shutdown = async () => {
-  clearInterval(drainTimer);
+  if (drainTimer) clearInterval(drainTimer);
+  if (drainQueue) await drainQueue.close();
   await app.close();
   if (store) await store.close();
   process.exit(0);

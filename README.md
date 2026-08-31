@@ -1,13 +1,14 @@
 # Financial Migration OS — engine + enterprise API
 
-Milestones 1 through 6 of the build brief: a deterministic migration engine, the
+Milestones 1 through 7 of the build brief: a deterministic migration engine, the
 multi-tenant API, webhooks, batch pipeline and operations dashboard around it, a
 Postgres adapter behind the same storage port the in-memory store uses, a
 connectivity abstraction with its first provider mapping (Powens), a
 recurring-payment detector that turns raw transaction history into the
-`RecurringPayment[]` the planner has consumed since Milestone 1, and batching
-that adapter's customer writes across an entire batch import, not just within
-one customer.
+`RecurringPayment[]` the planner has consumed since Milestone 1, batching
+that adapter's customer writes across an entire batch import, and a durable,
+restart-safe BullMQ schedule behind webhook delivery in place of an
+in-process timer.
 
 ## Milestone 1 — Migration Engine
 
@@ -23,7 +24,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 127 tests, in-memory store by default (128 against Postgres — one test is Postgres-only)
+npm test                      # 127 tests with no infrastructure running (131 with Postgres and Redis both up — see Milestones 6 and 7)
 ```
 
 Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
@@ -124,6 +125,7 @@ src/
   api/dashboard.ts       server-rendered operations view
   api/serializers.ts     wire format (snake_case, minor-unit money)
   webhooks/dispatcher.ts signing, backoff, dead-letter, replay
+  webhooks/queue.ts      durable BullMQ schedule for dispatcher.drain()
   batch/pipeline.ts      bulk import, batched planning, exception queue
   connectivity/types.ts  ConnectivityProvider — the §5 abstraction
   connectivity/powens.ts first provider: raw Powens accounts/transactions → canonical shapes
@@ -602,12 +604,65 @@ checks that exactly that customer fails while the rest of the chunk still
 imports — a case the in-memory store can't exercise at all (no `DATE` column
 to reject it), which is why the test is guarded rather than universal.
 
-## Not built (deliberately)
+## Milestone 7 — durable webhook queue
 
-**No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
-`serve.ts`; in production it is a BullMQ worker or a Temporal activity. The
-retry, backoff and dead-letter logic lives in the dispatcher precisely so that
-swap does not change behaviour.
+```bash
+REDIS_URL=redis://localhost:6379 npm run serve   # durable schedule instead of setInterval
+npm test                                          # 131 tests — 3 are Redis-only, see below
+```
+
+`WebhookDispatcher.drain()` used to be called from a bare `setInterval` in
+`serve.ts` — functional, but gone the instant the process exits. A crash or
+a deploy was a silent gap in webhook delivery until something happened to
+restart the server; nothing durable remembered the schedule should exist.
+
+**`src/webhooks/queue.ts` is the swap the dispatcher's own comment already
+promised**, and it changes nothing about *what* `drain()` decides — the
+retry/backoff/dead-letter logic in `dispatcher.ts` is untouched, byte for
+byte. `createDrainQueue` wraps a BullMQ `Queue` and `Worker` around the exact
+same `dispatcher.drain(limit)` call the old timer made, and uses
+`Queue.upsertJobScheduler` — idempotent on a stable scheduler id — to persist
+the repeat schedule in Redis rather than in a variable that dies with the
+process. `serve.ts` picks this over the old timer only when `REDIS_URL` is
+set, the same "durable infrastructure only if it's configured" pattern
+`DATABASE_URL` already established for the store — a bare `npm run serve`
+stays a zero-dependency demo.
+
+**Proven as a restart, not just a call.** The claim worth checking wasn't
+"does `drain()` still work" (it always did — the logic never moved) but
+"does the schedule survive the process going away." Verified against a live
+server, not just the test suite: registered a webhook endpoint, killed the
+server outright (`SIGTERM`, no graceful unwind), started a fresh process
+against the same Postgres and Redis, created a migration, and the event
+still reached the receiver — nothing had to be re-armed by hand, because
+both the endpoint (Postgres) and the drain schedule (Redis) were already
+durable before this milestone touched anything, and now `drain()`'s
+*trigger* is too.
+
+**Deliberately single-concurrency, and that's a real limit, not an
+oversight.** `listDueDeliveries` and `updateDelivery` are two separate
+transactions with no claim step between them — nothing stops two concurrent
+`drain()` sweeps from picking the same due delivery and both posting it.
+Receivers already have to tolerate that in principle (`fmos-idempotency-key`
+— at-least-once delivery was always the contract), so it's wasted work, not
+a correctness bug, but `createDrainQueue` fixes the Worker's own concurrency
+at 1 rather than exposing it as a knob, and running a second worker
+*process* against the same Redis would reopen the same race. Actual
+horizontal scaling needs a claim step added to the store first
+(`SELECT ... FOR UPDATE SKIP LOCKED`, marking a row claimed in the same
+transaction it's selected in) — not built here, because this milestone's
+job was matching the timer's behaviour durably, not changing its
+concurrency model.
+
+**`test/webhookQueue.test.ts` needs a real Redis**, the same reasoning as
+Milestone 6's Postgres-only test: the thing worth proving is that a real
+BullMQ `Worker` actually drains a delivery end to end, and that
+`upsertJobScheduler` really does converge to one schedule on a second call
+rather than accumulating a duplicate — neither is a claim a mocked BullMQ
+could check. Guarded with `describe.skipIf(!REDIS_URL)`, so `npm test` with
+no Redis running still passes, just without those three.
+
+## Not built (deliberately)
 
 **No customer-facing surface**, no document AI, no ops copilot. The AI layer
 from §15 consumes this output; none of it belongs in the decision path.
@@ -623,5 +678,8 @@ from §15 consumes this output; none of it belongs in the decision path.
    customer (Milestone 6 only batched customer *import*, not planning) — the
    same batch-across-customers tradeoff applies there if the remaining
    per-migration transaction overhead matters at real volume.
-3. Get the rule catalog in front of counsel before anything above is built on
+3. If webhook delivery ever needs more than one worker process: add a claim
+   step to `listDueDeliveries` (Milestone 7 fixed the queue's own
+   concurrency at 1 specifically because this wasn't built).
+4. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
