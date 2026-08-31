@@ -1,18 +1,23 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { wire, seedTenant, type Wiring } from '../src/api/bootstrap.js';
 import type { SeedResult } from '../src/api/bootstrap.js';
 import type { TenantContext } from '../src/store/types.js';
 import type { ImportRow } from '../src/batch/pipeline.js';
 import { money } from '../src/domain/types.js';
+import { freshStore, closeTestStore } from './testStore.js';
 
 let w: Wiring;
 let seed: SeedResult;
 let ctx: TenantContext;
 
 beforeEach(async () => {
-  w = wire({ post: async () => ({ status: 200 }) });
+  w = wire({ store: await freshStore(), post: async () => ({ status: 200 }) });
   seed = await seedTenant(w);
   ctx = { tenantId: seed.tenantId, role: 'ADMIN' };
+});
+
+afterAll(async () => {
+  await closeTestStore();
 });
 
 const row = (n: number, overrides: Partial<ImportRow> = {}): ImportRow => ({

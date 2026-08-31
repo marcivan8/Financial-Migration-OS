@@ -6,20 +6,23 @@ import { BatchPipeline } from '../batch/pipeline.js';
 import { buildServer, type ServerDeps } from './server.js';
 import { ORIGIN_BANK, DESTINATION_BANK } from '../fixtures/institutions.js';
 import { CUSTOMER, PRODUCTS, RECURRING_PAYMENTS } from '../fixtures/customer.js';
-import type { TenantContext } from '../store/types.js';
+import type { MigrationStore, TenantContext } from '../store/types.js';
 
 /**
  * Composition root. Everything that knows how the pieces fit together lives
  * here, so tests can assemble the same graph with a fake HTTP poster and a
- * frozen clock.
+ * frozen clock — and, now that `MigrationStore` has a second implementation,
+ * with any store that obeys the port.
  */
 
 export interface Wiring extends ServerDeps {
-  store: InMemoryStore;
+  store: MigrationStore;
 }
 
-export function wire(options: { post?: HttpPoster; clock?: () => Date } = {}): Wiring {
-  const store = new InMemoryStore();
+export function wire(
+  options: { post?: HttpPoster; clock?: () => Date; store?: MigrationStore } = {},
+): Wiring {
+  const store = options.store ?? new InMemoryStore();
   const keys = new ApiKeyRegistry();
   const clock = options.clock ?? (() => new Date());
   const webhooks = new WebhookDispatcher(store, options.post, clock);

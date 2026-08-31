@@ -1,7 +1,8 @@
 # Financial Migration OS — engine + enterprise API
 
-Milestones 1 and 2 of the build brief: a deterministic migration engine, and the
-multi-tenant API, webhooks, batch pipeline and operations dashboard around it.
+Milestones 1 through 3 of the build brief: a deterministic migration engine, the
+multi-tenant API, webhooks, batch pipeline and operations dashboard around it, and
+a Postgres adapter behind the same storage port the in-memory store uses.
 
 ## Milestone 1 — Migration Engine
 
@@ -17,8 +18,11 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 99 tests
+npm test                      # 99 tests, in-memory store by default
 ```
+
+Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
+see Milestone 3, below.
 
 ## What it does
 
@@ -108,6 +112,7 @@ src/
 
   store/types.ts         the storage port — tenant context on every call
   store/memory.ts        in-memory adapter obeying the same rules as the schema
+  store/postgres.ts      Postgres adapter — real RLS, real constraints
   auth/keys.ts           hashed API keys, roles, scopes
   api/service.ts         plan → persist → emit → publish (the only side effects)
   api/server.ts          Fastify routes, problem+json, audit
@@ -117,9 +122,11 @@ src/
   batch/pipeline.ts      bulk import, batched planning, exception queue
   serve.ts               boot with a seeded tenant
 
+db/migrate.ts             tracked, idempotent migration runner
 db/migrations/
   0001_init.sql          multi-tenant schema, append-only event log
   0002_rls.sql           row-level security policies
+  0003_postgres_adapter.sql  plan snapshot column, fmos_worker role
 ```
 
 ## ⚠️ The rules are not legal advice
@@ -192,8 +199,9 @@ Errors are RFC 9457 `application/problem+json`. Money is always
 
 `db/migrations/0001_init.sql` is the real schema; `0002_rls.sql` adds row-level
 security. `src/store/memory.ts` is an adapter that obeys the same rules, so the
-API and its tests run with no infrastructure and a Postgres adapter is a
-drop-in. Three things the schema enforces rather than trusting the application:
+API and its tests run with no infrastructure by default — and `src/store/postgres.ts`
+is the drop-in for when they shouldn't (Milestone 3, below). Three things the
+schema enforces rather than trusting the application:
 
 - **`tenant_id` on every row, plus RLS.** The application sets
   `app.tenant_id` per transaction and connects as a role without `BYPASSRLS`.
@@ -256,10 +264,75 @@ only with an icon and a word, because green-vs-red fails colourblind separation
 selected set of steps for the dark surface, under both the OS media query and an
 explicit theme stamp.
 
-## Five bugs the build surfaced
+## Milestone 3 — Postgres adapter
 
-Worth recording, because two of them were invisible until the system ran at more
-than one migration:
+```bash
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run db:migrate  # once
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 99 tests, real Postgres
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run serve       # data survives a restart
+```
+
+`src/store/postgres.ts` implements the same `MigrationStore` port as
+`src/store/memory.ts`. `wire()` takes either; `test/api.test.ts` and
+`test/batch.test.ts` run unmodified against whichever `DATABASE_URL` selects
+(`test/testStore.ts`), which is the actual point of writing the port first —
+nothing above it changes to prove the adapter works.
+
+**A generated plan is stored twice, on purpose.** `migrations.plan_snapshot`
+holds the `MigrationPlan` exactly as the planner produced it — JSONB, written
+once, never touched again — while `plan_items` / `migration_tasks` /
+`migration_exceptions` hold the same data normalised, and are what changes as
+execution proceeds. `getPlan()` reads the snapshot. This mirrors what the
+in-memory store already did (its `plans` map is separate from its live `tasks`
+and `exceptions` maps) rather than introducing new behaviour — reconstructing
+a plan from tables that execution has since mutated cannot promise the same
+byte-for-byte answer a frozen snapshot can.
+
+**RLS needed one deliberate hole, not a bypass.** `MigrationStore.listDueDeliveries`
+and `.updateDelivery` are cross-tenant by the port's own contract — a webhook
+retry loop has to see every tenant's due deliveries in one query, and "no
+tenant context set" is RLS's fail-safe-to-zero-rows direction, not
+fail-open. Granting `BYPASSRLS` on the application's main role would defeat
+RLS everywhere for that one worker's convenience; instead `db/migrations/0003`
+adds `fmos_worker`, a role with `BYPASSRLS` granted `SELECT, UPDATE` on
+`webhook_deliveries` alone, and the adapter switches to it (`SET LOCAL ROLE`)
+for exactly those two methods. Every other call runs as `fmos_app`, which RLS
+still fully constrains.
+
+**One FK had to give, for a reason worth keeping.** `audit_log.tenant_id`
+references `tenants(id)` like every other table — reasonable until an
+unauthenticated or forged-key request gets audited under `'unknown'` or a
+tenant id nobody issued (`server.ts`'s denial path does exactly this). Real
+Postgres rejected that insert with a foreign-key violation, turning a clean
+401 into a 500 — the in-memory store, which has no FK to violate, had been
+masking it the whole time the suite ran against it. A security log has to
+accept an attacker's claimed identity without vouching for it, so
+`PostgresStore.audit` creates a placeholder `tenants` row on demand rather
+than requiring the id to be real first — the same permissiveness the
+in-memory adapter had by construction, made explicit for the one table where
+referential integrity would otherwise get in the way of its purpose. Found
+running the suite against Postgres for the first time, not by review.
+
+**Throughput moved, deliberately not yet optimised.** The in-memory store
+plans 500 customers in ~600ms; the same batch against Postgres takes ~12s,
+because every migration write is a per-row transaction rather than a bulk
+insert. Correct before fast — batching the writes is a known next step, not a
+surprise.
+
+Local setup used for the above (`fmos_worker` is created by the migration
+itself):
+
+```sql
+CREATE ROLE fmos LOGIN PASSWORD '...';
+GRANT fmos_app TO fmos;
+GRANT fmos_worker TO fmos;
+GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO fmos;  -- test-only, for PostgresStore.resetForTests()
+```
+
+## Six bugs the build surfaced
+
+Worth recording, because three of them were invisible until the system ran at
+more than one migration — and one only showed up against a real database:
 
 1. **Nothing ever entered `IN_PROGRESS`.** A blocked task could not escalate, so
    a stalled PEA read as "authorized, all fine" on the dashboard. Fixed by
@@ -289,6 +362,11 @@ than one migration:
    `blockingExceptionCount` is a denormalised aggregate on `migrations`, set at
    creation and never refreshed, so it drifted in both directions. Every path
    that changes the exception set now recomputes it.
+6. **`audit_log`'s foreign key turned a 401 into a 500, only against real
+   Postgres.** Covered above (Milestone 3) — the in-memory store has no
+   referential integrity to violate, so 92 of the suite's 99 tests passed
+   against it while this was live; the other seven, all denial paths, only
+   failed once the same suite ran against Postgres for the first time.
 
 ## Not built (deliberately)
 
@@ -296,10 +374,6 @@ than one migration:
 canonical `FinancialProduct` values, which is the whole point — an open-banking
 provider gets plugged into a working engine rather than the engine being
 designed around a provider.
-
-**No Postgres adapter.** The schema is written and the port is defined; wiring
-`pg` to it is mechanical and deliberately not done, because the in-memory
-adapter keeps the test suite infrastructure-free.
 
 **No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
 `serve.ts`; in production it is a BullMQ worker or a Temporal activity. The
@@ -311,9 +385,10 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 ### Next
 
-1. Postgres adapter behind the existing `MigrationStore` port, and run the same
-   test suite against it.
-2. One open-banking provider mapped onto `FinancialProduct`, behind the
+1. One open-banking provider mapped onto `FinancialProduct`, behind the
    connectivity abstraction from §5.
+2. Batch the Postgres adapter's per-row writes (multi-row `INSERT`, or `COPY`
+   for the batch-import path) — correct first, the ~600ms-vs-~12s gap on a
+   500-customer plan is the next thing worth closing.
 3. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.

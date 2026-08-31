@@ -11,15 +11,18 @@
     "demo": "tsx src/cli.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "serve": "tsx src/serve.ts"
+    "serve": "tsx src/serve.ts",
+    "db:migrate": "tsx db/migrate.ts"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
+    "@types/pg": "^8.15.6",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^3.2.7"
   },
   "dependencies": {
-    "fastify": "^5.12.1"
+    "fastify": "^5.12.1",
+    "pg": "^8.16.3"
   }
 }

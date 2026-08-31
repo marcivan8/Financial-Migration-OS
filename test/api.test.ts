@@ -1,9 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { wire, seedTenant, buildServer, type Wiring } from '../src/api/bootstrap.js';
 import type { SeedResult } from '../src/api/bootstrap.js';
 import { signPayload, verifySignature } from '../src/webhooks/dispatcher.js';
 import { groupExceptions } from '../src/api/dashboard.js';
+import { freshStore, closeTestStore, usingPostgres } from './testStore.js';
+
+// Same 36 cases run twice in CI: once against the in-memory adapter (default)
+// and once against Postgres when DATABASE_URL is set — see test/testStore.ts.
+if (usingPostgres) console.log('api.test.ts running against Postgres (DATABASE_URL set)');
 
 let w: Wiring;
 let app: FastifyInstance;
@@ -13,6 +18,7 @@ let posted: { url: string; body: string; headers: Record<string, string> }[];
 beforeEach(async () => {
   posted = [];
   w = wire({
+    store: await freshStore(),
     post: async (url, body, headers) => {
       posted.push({ url, body, headers });
       return { status: 200 };
@@ -20,6 +26,10 @@ beforeEach(async () => {
   });
   seed = await seedTenant(w);
   app = buildServer(w);
+});
+
+afterAll(async () => {
+  await closeTestStore();
 });
 
 const auth = (key?: string) => ({ authorization: `Bearer ${key ?? seed.adminKey}` });

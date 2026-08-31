@@ -10,11 +10,20 @@
 
 import { wire, seedTenant, buildServer } from './api/bootstrap.js';
 import { seedPopulation } from './batch/demo.js';
+import { PostgresStore } from './store/postgres.js';
 
 const PORT = Number(process.env['PORT'] ?? 8080);
 const POPULATE = process.argv.includes('--populate');
+const DATABASE_URL = process.env['DATABASE_URL'];
 
-const w = wire();
+const store = DATABASE_URL ? PostgresStore.connect(DATABASE_URL) : undefined;
+if (DATABASE_URL) {
+  console.log(`Using Postgres store (${new URL(DATABASE_URL).host}). Run "npm run db:migrate" first if this is a fresh database.`);
+} else {
+  console.log('DATABASE_URL not set — using the in-memory store. Data does not survive a restart.');
+}
+
+const w = wire({ store });
 const seed = await seedTenant(w);
 
 if (POPULATE) {
@@ -38,6 +47,7 @@ const drainTimer = setInterval(() => {
 const shutdown = async () => {
   clearInterval(drainTimer);
   await app.close();
+  if (store) await store.close();
   process.exit(0);
 };
 process.on('SIGINT', shutdown);
