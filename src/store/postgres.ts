@@ -58,6 +58,26 @@ export interface PostgresStoreOptions {
 
 const isoOf = (v: string | Date): string => (v instanceof Date ? v.toISOString() : v);
 
+/**
+ * `($1,$2,$3),($4,$5,$6),...` for a multi-row INSERT.
+ *
+ * A migration with 20 tasks used to mean 20 round trips inside one
+ * transaction; a 500-customer batch plan spent most of its ~12s waiting on
+ * network round trips rather than the database itself. One statement per
+ * table per migration — still one row per array element, just not one
+ * network round trip per element.
+ */
+function valuesPlaceholders(rowCount: number, colCount: number): string {
+  const rows: string[] = [];
+  let p = 1;
+  for (let r = 0; r < rowCount; r++) {
+    const cols: string[] = [];
+    for (let c = 0; c < colCount; c++) cols.push(`$${p++}`);
+    rows.push(`(${cols.join(',')})`);
+  }
+  return rows.join(',');
+}
+
 function pgError(err: unknown): Error {
   const e = err as { code?: string; message?: string };
   if (e?.code === '23505') return new ConflictError(e.message ?? 'unique constraint violated');
@@ -268,33 +288,36 @@ export class PostgresStore implements MigrationStore {
 
   async putProducts(ctx: TenantContext, products: FinancialProduct[]): Promise<void> {
     if (products.length === 0) return;
+    const COLS = 11;
     await this.tx(ctx, async (c) => {
+      const params: unknown[] = [];
       for (const p of products) {
-        await c.query(
-          `INSERT INTO financial_products
-             (id, tenant_id, customer_id, institution_id, account_id, type, raw_label,
-              balance_minor, currency, opened_at, metadata)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-           ON CONFLICT (id) DO UPDATE SET
-             account_id = EXCLUDED.account_id, type = EXCLUDED.type,
-             raw_label = EXCLUDED.raw_label, balance_minor = EXCLUDED.balance_minor,
-             currency = EXCLUDED.currency, opened_at = EXCLUDED.opened_at,
-             metadata = EXCLUDED.metadata`,
-          [
-            p.id,
-            ctx.tenantId,
-            p.customerId,
-            p.institutionId,
-            p.accountId,
-            p.type,
-            p.rawLabel,
-            p.balance.amount,
-            p.balance.currency,
-            p.openedAt,
-            JSON.stringify({ ...p.metadata, transferable: p.transferable }),
-          ],
+        params.push(
+          p.id,
+          ctx.tenantId,
+          p.customerId,
+          p.institutionId,
+          p.accountId,
+          p.type,
+          p.rawLabel,
+          p.balance.amount,
+          p.balance.currency,
+          p.openedAt,
+          JSON.stringify({ ...p.metadata, transferable: p.transferable }),
         );
       }
+      await c.query(
+        `INSERT INTO financial_products
+           (id, tenant_id, customer_id, institution_id, account_id, type, raw_label,
+            balance_minor, currency, opened_at, metadata)
+         VALUES ${valuesPlaceholders(products.length, COLS)}
+         ON CONFLICT (id) DO UPDATE SET
+           account_id = EXCLUDED.account_id, type = EXCLUDED.type,
+           raw_label = EXCLUDED.raw_label, balance_minor = EXCLUDED.balance_minor,
+           currency = EXCLUDED.currency, opened_at = EXCLUDED.opened_at,
+           metadata = EXCLUDED.metadata`,
+        params,
+      );
     });
   }
 
@@ -311,34 +334,37 @@ export class PostgresStore implements MigrationStore {
 
   async putRecurringPayments(ctx: TenantContext, payments: RecurringPayment[]): Promise<void> {
     if (payments.length === 0) return;
+    const COLS = 12;
     await this.tx(ctx, async (c) => {
+      const params: unknown[] = [];
       for (const p of payments) {
-        await c.query(
-          `INSERT INTO recurring_payments
-             (id, tenant_id, customer_id, account_id, merchant, amount_minor, currency,
-              frequency, category, direction, confidence, migration_status)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-           ON CONFLICT (id) DO UPDATE SET
-             merchant = EXCLUDED.merchant, amount_minor = EXCLUDED.amount_minor,
-             currency = EXCLUDED.currency, frequency = EXCLUDED.frequency,
-             category = EXCLUDED.category, direction = EXCLUDED.direction,
-             confidence = EXCLUDED.confidence, migration_status = EXCLUDED.migration_status`,
-          [
-            p.id,
-            ctx.tenantId,
-            p.customerId,
-            p.accountId,
-            p.merchant,
-            p.amount.amount,
-            p.amount.currency,
-            p.frequency,
-            p.category,
-            p.direction,
-            p.confidence,
-            p.migrationStatus,
-          ],
+        params.push(
+          p.id,
+          ctx.tenantId,
+          p.customerId,
+          p.accountId,
+          p.merchant,
+          p.amount.amount,
+          p.amount.currency,
+          p.frequency,
+          p.category,
+          p.direction,
+          p.confidence,
+          p.migrationStatus,
         );
       }
+      await c.query(
+        `INSERT INTO recurring_payments
+           (id, tenant_id, customer_id, account_id, merchant, amount_minor, currency,
+            frequency, category, direction, confidence, migration_status)
+         VALUES ${valuesPlaceholders(payments.length, COLS)}
+         ON CONFLICT (id) DO UPDATE SET
+           merchant = EXCLUDED.merchant, amount_minor = EXCLUDED.amount_minor,
+           currency = EXCLUDED.currency, frequency = EXCLUDED.frequency,
+           category = EXCLUDED.category, direction = EXCLUDED.direction,
+           confidence = EXCLUDED.confidence, migration_status = EXCLUDED.migration_status`,
+        params,
+      );
     });
   }
 
@@ -402,14 +428,11 @@ export class PostgresStore implements MigrationStore {
         throw err;
       }
 
-      for (const item of plan.items) {
-        await c.query(
-          `INSERT INTO plan_items
-             (id, tenant_id, migration_id, subject, subject_id, product_type, category, label,
-              action, rule_id, rationale, balance_minor, currency, preserves_tax_history,
-              estimated_duration_days, estimated_fees_minor)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-          [
+      if (plan.items.length > 0) {
+        const COLS = 16;
+        const params: unknown[] = [];
+        for (const item of plan.items) {
+          params.push(
             item.id,
             ctx.tenantId,
             plan.migrationId,
@@ -426,18 +449,24 @@ export class PostgresStore implements MigrationStore {
             item.preservesTaxHistory,
             item.estimatedDurationDays,
             item.estimatedFees?.amount ?? 0,
-          ],
+          );
+        }
+        await c.query(
+          `INSERT INTO plan_items
+             (id, tenant_id, migration_id, subject, subject_id, product_type, category, label,
+              action, rule_id, rationale, balance_minor, currency, preserves_tax_history,
+              estimated_duration_days, estimated_fees_minor)
+           VALUES ${valuesPlaceholders(plan.items.length, COLS)}`,
+          params,
         );
       }
 
-      const position = new Map(plan.executionOrder.map((id, idx) => [id, idx]));
-      for (const task of plan.tasks) {
-        await c.query(
-          `INSERT INTO migration_tasks
-             (id, tenant_id, migration_id, item_id, type, label, status, actor, sla_days,
-              dependencies, documents, position)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-          [
+      if (plan.tasks.length > 0) {
+        const COLS = 12;
+        const position = new Map(plan.executionOrder.map((id, idx) => [id, idx]));
+        const params: unknown[] = [];
+        plan.tasks.forEach((task, idx) => {
+          params.push(
             task.id,
             ctx.tenantId,
             plan.migrationId,
@@ -449,17 +478,38 @@ export class PostgresStore implements MigrationStore {
             task.slaDays,
             task.dependencies,
             JSON.stringify(task.documents),
-            position.get(task.id) ?? plan.tasks.indexOf(task),
-          ],
+            position.get(task.id) ?? idx,
+          );
+        });
+        await c.query(
+          `INSERT INTO migration_tasks
+             (id, tenant_id, migration_id, item_id, type, label, status, actor, sla_days,
+              dependencies, documents, position)
+           VALUES ${valuesPlaceholders(plan.tasks.length, COLS)}`,
+          params,
         );
       }
 
-      for (const exc of plan.exceptions) {
+      if (plan.exceptions.length > 0) {
+        const COLS = 8;
+        const params: unknown[] = [];
+        for (const exc of plan.exceptions) {
+          params.push(
+            exc.id,
+            ctx.tenantId,
+            plan.migrationId,
+            exc.code,
+            exc.severity,
+            exc.message,
+            exc.resolution,
+            exc.subjectId,
+          );
+        }
         await c.query(
           `INSERT INTO migration_exceptions
              (id, tenant_id, migration_id, code, severity, message, resolution, subject_id)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [exc.id, ctx.tenantId, plan.migrationId, exc.code, exc.severity, exc.message, exc.resolution, exc.subjectId],
+           VALUES ${valuesPlaceholders(plan.exceptions.length, COLS)}`,
+          params,
         );
       }
 
@@ -657,21 +707,28 @@ export class PostgresStore implements MigrationStore {
 
   async appendEvents(ctx: TenantContext, events: MigrationEvent[]): Promise<void> {
     if (events.length === 0) return;
+    const COLS = 6;
     await this.tx(ctx, async (c) => {
+      const params: unknown[] = [];
       for (const event of events) {
-        await c.query(
-          `INSERT INTO migration_events (tenant_id, migration_id, sequence, type, payload, occurred_at)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [
-            ctx.tenantId,
-            event.migrationId,
-            event.sequence,
-            event.type,
-            JSON.stringify(event.payload),
-            event.occurredAt,
-          ],
+        params.push(
+          ctx.tenantId,
+          event.migrationId,
+          event.sequence,
+          event.type,
+          JSON.stringify(event.payload),
+          event.occurredAt,
         );
       }
+      // One statement for the whole batch, still inside the caller's
+      // transaction: a duplicate sequence anywhere in it rolls the lot back,
+      // same as the per-row loop this replaced (this.tx already wraps every
+      // call in BEGIN/COMMIT/ROLLBACK).
+      await c.query(
+        `INSERT INTO migration_events (tenant_id, migration_id, sequence, type, payload, occurred_at)
+         VALUES ${valuesPlaceholders(events.length, COLS)}`,
+        params,
+      );
     });
   }
 

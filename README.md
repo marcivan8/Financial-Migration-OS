@@ -313,11 +313,16 @@ in-memory adapter had by construction, made explicit for the one table where
 referential integrity would otherwise get in the way of its purpose. Found
 running the suite against Postgres for the first time, not by review.
 
-**Throughput moved, deliberately not yet optimised.** The in-memory store
-plans 500 customers in ~600ms; the same batch against Postgres takes ~12s,
-because every migration write is a per-row transaction rather than a bulk
-insert. Correct before fast — batching the writes is a known next step, not a
-surprise.
+**Throughput moved, and most of the gap has since closed.** The in-memory
+store plans 500 customers in ~600ms. The first Postgres adapter took ~12s for
+the same batch — every plan item, task and exception was its own network
+round trip inside the migration's transaction. Batching each table into one
+multi-row `INSERT` per migration (`valuesPlaceholders` in `postgres.ts`) cut
+that to ~7s. What's left is mostly per-migration transaction overhead (`BEGIN`
+/ role switch / `set_config` / `COMMIT`, 500 times over 25-way concurrency) —
+batching *across* customers, not just within one, would be the next cut, and
+isn't free: it means a failure in customer 214 can no longer be isolated from
+customer 213 by a transaction boundary the way `importRows` promises today.
 
 Local setup used for the above (`fmos_worker` is created by the migration
 itself):
@@ -387,8 +392,9 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 1. One open-banking provider mapped onto `FinancialProduct`, behind the
    connectivity abstraction from §5.
-2. Batch the Postgres adapter's per-row writes (multi-row `INSERT`, or `COPY`
-   for the batch-import path) — correct first, the ~600ms-vs-~12s gap on a
-   500-customer plan is the next thing worth closing.
+2. If the remaining ~7s on a 500-customer Postgres plan matters at real
+   volume: batch *across* customers, not just within one — deliberately not
+   done yet, because it trades away the per-customer transaction isolation
+   `importRows` currently gives failure handling.
 3. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
