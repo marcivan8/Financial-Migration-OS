@@ -288,7 +288,7 @@ export class PostgresStore implements MigrationStore {
 
   async putProducts(ctx: TenantContext, products: FinancialProduct[]): Promise<void> {
     if (products.length === 0) return;
-    const COLS = 11;
+    const COLS = 13;
     await this.tx(ctx, async (c) => {
       const params: unknown[] = [];
       for (const p of products) {
@@ -304,18 +304,21 @@ export class PostgresStore implements MigrationStore {
           p.balance.currency,
           p.openedAt,
           JSON.stringify({ ...p.metadata, transferable: p.transferable }),
+          p.sourceProvider ?? null,
+          p.sourceFetchedAt ?? null,
         );
       }
       await c.query(
         `INSERT INTO financial_products
            (id, tenant_id, customer_id, institution_id, account_id, type, raw_label,
-            balance_minor, currency, opened_at, metadata)
+            balance_minor, currency, opened_at, metadata, source_provider, source_fetched_at)
          VALUES ${valuesPlaceholders(products.length, COLS)}
          ON CONFLICT (id) DO UPDATE SET
            account_id = EXCLUDED.account_id, type = EXCLUDED.type,
            raw_label = EXCLUDED.raw_label, balance_minor = EXCLUDED.balance_minor,
            currency = EXCLUDED.currency, opened_at = EXCLUDED.opened_at,
-           metadata = EXCLUDED.metadata`,
+           metadata = EXCLUDED.metadata, source_provider = EXCLUDED.source_provider,
+           source_fetched_at = EXCLUDED.source_fetched_at`,
         params,
       );
     });
@@ -1079,6 +1082,8 @@ function rowToProduct(r: Record<string, unknown>): FinancialProduct {
     openedAt: r.opened_at_text as string,
     transferable,
     metadata: metadata as FinancialProduct['metadata'],
+    sourceProvider: (r.source_provider as string | null) ?? undefined,
+    sourceFetchedAt: r.source_fetched_at ? isoOf(r.source_fetched_at as string | Date) : undefined,
   };
 }
 

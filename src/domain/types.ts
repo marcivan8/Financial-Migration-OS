@@ -173,6 +173,16 @@ export interface FinancialProduct {
   /** Set by the rules engine, never by the connectivity layer. */
   transferable?: boolean;
   metadata: ProductMetadata;
+  /**
+   * Which connectivity provider produced this row (e.g. 'powens') and when it
+   * was fetched — for debugging, and for the day a provider's normalisation
+   * changes underneath you. Undefined for hand-built fixtures and rows
+   * imported without a connectivity layer (the batch pipeline, today).
+   * `db/migrations/0001_init.sql` reserved these columns before anything
+   * populated them; the connectivity layer is what finally does.
+   */
+  sourceProvider?: string;
+  sourceFetchedAt?: string;
 }
 
 /**

@@ -1,8 +1,9 @@
 # Financial Migration OS — engine + enterprise API
 
-Milestones 1 through 3 of the build brief: a deterministic migration engine, the
-multi-tenant API, webhooks, batch pipeline and operations dashboard around it, and
-a Postgres adapter behind the same storage port the in-memory store uses.
+Milestones 1 through 4 of the build brief: a deterministic migration engine, the
+multi-tenant API, webhooks, batch pipeline and operations dashboard around it, a
+Postgres adapter behind the same storage port the in-memory store uses, and a
+connectivity abstraction with its first provider mapping (Powens).
 
 ## Milestone 1 — Migration Engine
 
@@ -120,6 +121,8 @@ src/
   api/serializers.ts     wire format (snake_case, minor-unit money)
   webhooks/dispatcher.ts signing, backoff, dead-letter, replay
   batch/pipeline.ts      bulk import, batched planning, exception queue
+  connectivity/types.ts  ConnectivityProvider — the §5 abstraction
+  connectivity/powens.ts first provider: raw Powens accounts → FinancialProduct
   serve.ts               boot with a seeded tenant
 
 db/migrate.ts             tracked, idempotent migration runner
@@ -373,12 +376,66 @@ more than one migration — and one only showed up against a real database:
    against it while this was live; the other seven, all denial paths, only
    failed once the same suite ran against Postgres for the first time.
 
-## Not built (deliberately)
+## Milestone 4 — connectivity
 
-**No connectivity layer.** No Powens, no Tink, no TrueLayer. Products arrive as
-canonical `FinancialProduct` values, which is the whole point — an open-banking
-provider gets plugged into a working engine rather than the engine being
-designed around a provider.
+```bash
+npm test   # includes test/connectivity.test.ts — 8 tests, no network, no live Powens account
+```
+
+`src/connectivity/types.ts` is the abstraction from §5 of the brief:
+`ConnectivityProvider.normalizeAccounts(raw, ctx)` turns a provider's own raw
+shape into canonical `FinancialProduct[]`, and that is the entire interface —
+no HTTP client, no auth flow. Fetching varies by provider and by deployment;
+the part worth capturing in code once is the mapping, so that's the only part
+this interface owns.
+
+`src/connectivity/powens.ts` is the first provider, chosen because Powens'
+account-type taxonomy already distinguishes `livret_a`, `ldds`, `pel`, `cel`
+and `pea` rather than lumping French regulated savings under one generic
+"savings" type — which is exactly the classification work the rules engine
+needs done *before* a product reaches it. (Field names and the type enum are
+modeled from Powens' public API reference, checked while writing this file,
+not integration-tested against a live account — the same caveat the rule
+catalog already carries.)
+
+**A provider is allowed to not know something, and has to say so rather than
+guess.** Three real gaps came out of mapping Powens specifically, and all
+three are reported through `NormalizationResult.skipped` rather than solved
+by assumption:
+
+- Powens' generic `savings` type doesn't distinguish a LEP from a plain
+  unregulated livret — the difference changes which rule applies, so a
+  `savings` account is skipped, not defaulted to `LIVRET_A` because that's
+  the common case.
+- Powens' `loan` type doesn't distinguish a mortgage from any other loan —
+  every Powens loan lands as `LOAN`, never `MORTGAGE`. A real limitation of
+  classifying from `type` alone, left visible rather than papered over.
+- Powens' account object has no opening-date field. `openedAt` still needs a
+  value (the domain type requires one), so it falls back to `last_update` — a
+  sync timestamp, not the account's real age. It is deliberately *never* used
+  for `metadata.fiscalSeniorityDate`: that stays unset for every
+  Powens-sourced PEA/PEL/CEL, which routes straight into the rules engine's
+  existing `MISSING_PRODUCT_METADATA` check (`rules/engine.ts`) — the
+  connectivity boundary and the rules engine's exception handling compose
+  without new glue code, which `test/connectivity.test.ts`'s last case checks
+  for real rather than asserting in a comment.
+
+**`financial_products.source_provider` and `source_fetched_at` were reserved
+in the schema since `db/migrations/0001_init.sql`, unpopulated until now.**
+`FinancialProduct` had no field to carry them, so `PostgresStore.putProducts`
+had nothing to write. Both are now on the domain type (optional — hand-built
+fixtures and the batch pipeline's plain CSV-shaped import still don't set
+them) and wired through the adapter.
+
+**Not built alongside this:** recurring-payment detection from raw
+transactions. Powens' API doesn't expose it either (checked directly — its
+"Subscriptions" product retrieves bills/proof documents, not spending
+patterns), and it's a different kind of component from account normalization
+— a detector, closer to the AI layer in §15 than to connectivity. The
+existing `RecurringPayment[]` input still has to come from somewhere else
+until that's built.
+
+## Not built (deliberately)
 
 **No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
 `serve.ts`; in production it is a BullMQ worker or a Temporal activity. The
@@ -390,11 +447,16 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 ### Next
 
-1. One open-banking provider mapped onto `FinancialProduct`, behind the
-   connectivity abstraction from §5.
-2. If the remaining ~7s on a 500-customer Postgres plan matters at real
+1. Wire `PowensProvider` into the batch/API path — today it's a pure mapper
+   with no caller; `importRows` still takes pre-normalized `ImportRow`s. The
+   natural seam is a new import path that takes raw Powens accounts and calls
+   `normalizeAccounts` before `putProducts`, reporting `skipped` alongside the
+   existing per-row `BatchFailure`s.
+2. A recurring-payment detector — the input `RecurringPayment[]` still has to
+   come from somewhere; see Milestone 4.
+3. If the remaining ~7s on a 500-customer Postgres plan matters at real
    volume: batch *across* customers, not just within one — deliberately not
    done yet, because it trades away the per-customer transaction isolation
    `importRows` currently gives failure handling.
-3. Get the rule catalog in front of counsel before anything above is built on
+4. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
