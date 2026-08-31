@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { normalizePowensAccounts, PowensProvider } from '../src/connectivity/powens.js';
+import { normalizePowensAccounts, normalizePowensTransactions, PowensProvider } from '../src/connectivity/powens.js';
 import { POWENS_SAMPLE_ACCOUNTS } from '../src/connectivity/fixtures/powens-sample.js';
+import { POWENS_SAMPLE_TRANSACTIONS } from '../src/connectivity/fixtures/powens-transactions-sample.js';
 import { resolveProduct } from '../src/rules/engine.js';
 import { CUSTOMER } from '../src/fixtures/customer.js';
 import { ORIGIN_BANK, DESTINATION_BANK } from '../src/fixtures/institutions.js';
+import { detectRecurringPayments } from '../src/detection/recurring.js';
 
 const ctx = { customerId: CUSTOMER.id, institutionId: ORIGIN_BANK.id, fetchedAt: '2026-08-31T00:00:00.000Z' };
 
@@ -73,5 +75,39 @@ describe('Powens connectivity adapter', () => {
       destination: DESTINATION_BANK,
     });
     expect(decision.exceptions.some((e) => e.code === 'MISSING_PRODUCT_METADATA')).toBe(true);
+  });
+});
+
+describe('Powens transaction adapter', () => {
+  const txCtx = { customerId: CUSTOMER.id, accountId: '9001' };
+
+  it('maps the three settled transactions and skips the pending and deleted ones', () => {
+    const { transactions, skipped } = normalizePowensTransactions(POWENS_SAMPLE_TRANSACTIONS, txCtx);
+    expect(transactions).toHaveLength(3);
+    expect(skipped).toHaveLength(2);
+    expect(skipped.find((s) => s.externalTransactionId === '50004')?.reason).toMatch(/pending/);
+    expect(skipped.find((s) => s.externalTransactionId === '50005')?.reason).toMatch(/deleted/);
+  });
+
+  it('signs the amount negative for a debit and derives OUTBOUND from it', () => {
+    const { transactions } = normalizePowensTransactions(POWENS_SAMPLE_TRANSACTIONS, txCtx);
+    expect(transactions[0]!.amount).toEqual({ amount: -999, currency: 'EUR' });
+    expect(transactions[0]!.direction).toBe('OUTBOUND');
+  });
+
+  it("prefers Powens' own counterparty extraction over the wording fallbacks", () => {
+    const { transactions } = normalizePowensTransactions(POWENS_SAMPLE_TRANSACTIONS, txCtx);
+    expect(transactions[0]!.counterpartyLabel).toBe('Netflix');
+    expect(transactions[0]!.rawLabel).toBe('PRLV NETFLIX.COM');
+  });
+
+  it('composes with the recurring-payment detector end to end, three Netflix debits in', () => {
+    // The whole point of normalizing to the canonical Transaction shape: the
+    // detector never has to know these three rows came from Powens.
+    const { transactions } = normalizePowensTransactions(POWENS_SAMPLE_TRANSACTIONS, txCtx);
+    const detected = detectRecurringPayments(transactions);
+    expect(detected).toHaveLength(1);
+    expect(detected[0]!.merchant).toBe('Netflix');
+    expect(detected[0]!.frequency).toBe('MONTHLY');
   });
 });

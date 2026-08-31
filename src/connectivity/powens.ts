@@ -1,5 +1,10 @@
-import type { FinancialProduct, ProductType } from '../domain/types.js';
-import type { ConnectivityProvider, NormalizationResult, SkippedAccount } from './types.js';
+import type { FinancialProduct, ProductType, Transaction } from '../domain/types.js';
+import type {
+  ConnectivityProvider,
+  NormalizationResult,
+  SkippedAccount,
+  TransactionNormalizationResult,
+} from './types.js';
 
 /**
  * Powens (formerly Budget Insight) — a French/EU open banking aggregator.
@@ -162,7 +167,100 @@ export function normalizePowensAccounts(
   return { products, skipped };
 }
 
+// ---------------------------------------------------------------------------
+// Transactions — feeding recurring-payment detection (src/detection/recurring.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Modeled from Powens' `GET /2.0/users/{userId}/accounts/{accountId}/transactions`
+ * reference (docs.powens.com), checked while writing this file — same caveat
+ * as the account shape above: documented, not integration-tested live.
+ *
+ * Two things the docs leave genuinely open, called out rather than guessed:
+ *
+ * 1. Sign convention. The docs describe `value` as the transaction amount but
+ *    do not explicitly confirm "negative = debit" anywhere reachable from the
+ *    public reference. This mapping assumes it — it is the near-universal
+ *    convention among account-aggregation APIs, and every field name in this
+ *    file (`debit`-shaped and `credit`-shaped values sharing one signed field
+ *    called `value`) points the same way — but it is an assumption, not a
+ *    confirmed fact, and belongs on the list of things to verify against a
+ *    live sandbox before this ships, alongside the rest of this file.
+ * 2. `id_cluster` ("if the transaction is part of a cluster") looks like it
+ *    could be Powens' own recurring-transaction grouping, but the docs do not
+ *    describe it as one. Rather than build on an unconfirmed feature, the
+ *    detector below (`detectRecurringPayments`) does its own grouping from
+ *    counterparty + amount + interval and ignores `id_cluster` entirely. If
+ *    `id_cluster` does turn out to be Powens' own recurrence signal, it is a
+ *    cross-check to add later, not a foundation to build on now.
+ */
+export interface PowensTransaction {
+  id: number;
+  id_account: number;
+  /** Booking/posted date, `YYYY-MM-DD`. */
+  date: string;
+  /** Signed, major units (euros) — see the sign-convention caveat above. Null while a transaction is still pending in some cases. */
+  value: number | null;
+  original_wording: string;
+  simplified_wording: string | null;
+  wording: string | null;
+  counterparty: { label: string; type: 'creditor' | 'debtor' } | null;
+  deleted: string | null;
+}
+
+/** Reused from the account mapping — Powens floats major units, this domain is integer minor units. */
+function toMinorUnitsSigned(major: number): number {
+  return Math.round(major * 100);
+}
+
+export function normalizePowensTransactions(
+  raw: unknown[],
+  ctx: { customerId: string; accountId: string },
+): TransactionNormalizationResult {
+  const transactions: Transaction[] = [];
+  const skipped: TransactionNormalizationResult['skipped'] = [];
+
+  for (const entry of raw) {
+    const tx = entry as PowensTransaction;
+    const externalId = String(tx.id);
+
+    if (tx.deleted) {
+      skipped.push({ externalTransactionId: externalId, reason: 'deleted at the origin' });
+      continue;
+    }
+    if (tx.value === null) {
+      skipped.push({ externalTransactionId: externalId, reason: 'no value — still pending at the origin' });
+      continue;
+    }
+
+    // Fallback chain for "who is this": Powens' own counterparty extraction
+    // first (highest quality when present — PSD2 data does not always carry
+    // it), then the bank-cleaned label, then the user-editable one, then the
+    // raw statement text. Whichever wins is what the detector below groups by.
+    const counterpartyLabel =
+      tx.counterparty?.label || tx.simplified_wording || tx.wording || tx.original_wording;
+
+    transactions.push({
+      id: `${ctx.customerId}_powens_tx_${externalId}`,
+      accountId: ctx.accountId,
+      customerId: ctx.customerId,
+      date: tx.date,
+      amount: {
+        amount: toMinorUnitsSigned(tx.value),
+        currency: 'EUR',
+      },
+      direction: tx.value < 0 ? 'OUTBOUND' : 'INBOUND',
+      counterpartyLabel,
+      rawLabel: tx.original_wording,
+      sourceProvider: 'powens',
+    });
+  }
+
+  return { transactions, skipped };
+}
+
 export const PowensProvider: ConnectivityProvider = {
   id: 'powens',
   normalizeAccounts: normalizePowensAccounts,
+  normalizeTransactions: normalizePowensTransactions,
 };

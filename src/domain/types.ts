@@ -212,6 +212,33 @@ export interface ProductMetadata {
 export type PaymentDirection = 'INBOUND' | 'OUTBOUND';
 export type PaymentFrequency = 'WEEKLY' | 'MONTHLY' | 'QUARTERLY' | 'ANNUAL';
 
+/**
+ * A single bank transaction, normalised the same way `FinancialProduct` is:
+ * whatever the provider's raw shape looks like, everything above the
+ * connectivity layer sees this and only this.
+ *
+ * One deliberate deviation from the rest of the domain model: `amount.amount`
+ * is signed here, negative for money leaving the account. Every other use of
+ * `Money` in this codebase (balances, fees) is a non-negative quantity: this
+ * is the one place a transaction's direction is encoded in its sign, because
+ * that is how providers hand it over and re-deriving `direction` from it is
+ * cheaper and less error-prone than trusting a separately-populated flag.
+ */
+export interface Transaction {
+  id: string;
+  accountId: string;
+  customerId: string;
+  /** Posted/booking date the provider reports, ISO 8601. What recurrence is measured against. */
+  date: string;
+  amount: Money;
+  direction: PaymentDirection;
+  /** Cleaned label, e.g. Powens' `simplified_wording` — the best available "who is this" identifier. */
+  counterpartyLabel: string;
+  /** Raw statement text, kept for audit/debugging — never used for matching. */
+  rawLabel: string;
+  sourceProvider?: string;
+}
+
 export type PaymentCategory =
   | 'SALARY'
   | 'RENT'

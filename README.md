@@ -1,9 +1,11 @@
 # Financial Migration OS — engine + enterprise API
 
-Milestones 1 through 4 of the build brief: a deterministic migration engine, the
+Milestones 1 through 5 of the build brief: a deterministic migration engine, the
 multi-tenant API, webhooks, batch pipeline and operations dashboard around it, a
-Postgres adapter behind the same storage port the in-memory store uses, and a
-connectivity abstraction with its first provider mapping (Powens).
+Postgres adapter behind the same storage port the in-memory store uses, a
+connectivity abstraction with its first provider mapping (Powens), and a
+recurring-payment detector that turns raw transaction history into the
+`RecurringPayment[]` the planner has consumed since Milestone 1.
 
 ## Milestone 1 — Migration Engine
 
@@ -19,7 +21,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 99 tests, in-memory store by default
+npm test                      # 127 tests, in-memory store by default
 ```
 
 Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
@@ -122,7 +124,8 @@ src/
   webhooks/dispatcher.ts signing, backoff, dead-letter, replay
   batch/pipeline.ts      bulk import, batched planning, exception queue
   connectivity/types.ts  ConnectivityProvider — the §5 abstraction
-  connectivity/powens.ts first provider: raw Powens accounts → FinancialProduct
+  connectivity/powens.ts first provider: raw Powens accounts/transactions → canonical shapes
+  detection/recurring.ts recurring-payment detector — Transaction[] → RecurringPayment[]
   serve.ts               boot with a seeded tenant
 
 db/migrate.ts             tracked, idempotent migration runner
@@ -271,7 +274,7 @@ explicit theme stamp.
 
 ```bash
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run db:migrate  # once
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 99 tests, real Postgres
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 127 tests, real Postgres
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run serve       # data survives a restart
 ```
 
@@ -379,7 +382,7 @@ more than one migration — and one only showed up against a real database:
 ## Milestone 4 — connectivity
 
 ```bash
-npm test   # includes test/connectivity.test.ts — 8 tests, no network, no live Powens account
+npm test   # includes test/connectivity.test.ts — 12 tests, no network, no live Powens account
 ```
 
 `src/connectivity/types.ts` is the abstraction from §5 of the brief:
@@ -431,9 +434,8 @@ them) and wired through the adapter.
 transactions. Powens' API doesn't expose it either (checked directly — its
 "Subscriptions" product retrieves bills/proof documents, not spending
 patterns), and it's a different kind of component from account normalization
-— a detector, closer to the AI layer in §15 than to connectivity. The
-existing `RecurringPayment[]` input still has to come from somewhere else
-until that's built.
+— a detector, closer to the AI layer in §15 than to connectivity, but still
+deterministic rather than model-based. Built in Milestone 5, below.
 
 ### Wired to a caller
 
@@ -454,6 +456,100 @@ guessing which provider was meant. Verified against a live server, not just
 the test suite: `POST .../import/powens` end to end, including the 422 for an
 unregistered provider name.
 
+## Milestone 5 — recurring-payment detection
+
+```bash
+npm test   # includes test/detection.test.ts — 10 tests, deterministic fixtures, no live data
+```
+
+`src/detection/recurring.ts` turns a customer's transaction history into
+`RecurringPayment[]` — the same shape `planner/planner.ts` has consumed since
+Milestone 1, previously only ever supplied by hand (`test/batch.test.ts`'s
+`row()` fixture, or a customer created with `recurring_payments` in the
+request body). Pure and deterministic, same discipline as the rules engine
+and the connectivity layer: a merchant + amount + interval heuristic, no
+model, no external service, thresholds exported rather than hidden so a
+caller can recalibrate them against real data without forking the file.
+
+**How it groups.** Transactions are keyed by (account, direction, normalised
+counterparty), then sub-clustered by amount within a group (±25%, greedy
+1D clustering) — a merchant with both a fixed subscription and unrelated
+one-off purchases only has the subscription flagged. A cluster needs at
+least 3 occurrences (two dates are a coincidence, not a cadence) and a
+regular interval — coefficient of variation of the gaps between occurrences
+capped at 0.4 — to be considered recurring at all. That interval check is a
+hard gate, not a confidence penalty: `test/detection.test.ts` includes six
+same-store, similar-amount grocery-shopping transactions with no fixed
+cadence specifically to prove the detector does not flag them. Amount
+consistency, by contrast, is *not* a hard gate — a genuinely variable
+utility bill still detects, just at lower confidence, because real recurring
+bills legitimately vary in amount while staying the same relationship.
+
+**Confidence** blends three signals already in [0,1] — interval regularity
+(45%), amount consistency (35%), sample size (20%) — into the same
+`0..1` score `RecurringPayment.confidence` has always carried. Nothing
+downstream had to change: the planner's existing `RECURRING_CONFIDENCE_THRESHOLD`
+(0.7) and `LOW_CONFIDENCE_RECURRING_PAYMENT` exception already handled a
+below-threshold detection by planning a `MANUAL_REVIEW` task before an
+operator notifies the counterparty — this is the same composition claim
+Milestone 4 made for `MISSING_PRODUCT_METADATA`, checked the same way: a
+real fixture (a variable-amount utility bill, deliberately calibrated to
+land at ~0.68) run through the actual planner in `test/batch.test.ts`, not
+asserted in a comment.
+
+**Category is mostly left alone, on purpose.** Every detection defaults to
+`OTHER`. The one exception is `SALARY`: the largest inbound monthly cluster
+on an account is tagged `SALARY`, a narrow, well-established heuristic in
+account aggregation ("the biggest regular monthly deposit is almost always
+the paycheck"), not a general classifier. `RENT`, `UTILITIES`, `TELECOM`,
+`SUBSCRIPTION`, `INSURANCE`, `TAX` and `LOAN_REPAYMENT` are not attempted —
+that needs either a merchant-name taxonomy (not built) or a provider's own
+category feed mapped against a confirmed schema. Powens' `categories` field
+looked like it might cover this during research, but its exact taxonomy
+isn't documented anywhere this file could verify against the public
+reference, so guessing at a mapping stayed off the table — the same choice
+this repo already made for Powens' ambiguous account types in Milestone 4.
+
+**`src/connectivity/powens.ts` gained `normalizePowensTransactions`**, the
+transaction-side counterpart to the account mapping, wired onto
+`PowensProvider.normalizeTransactions` (now an optional method on
+`ConnectivityProvider` — not every provider this engine will ever talk to
+exposes transaction history the same way, or at all). Two open questions
+came out of it, called out rather than assumed away:
+
+- **Sign convention.** Powens' docs describe `value` as signed but do not
+  explicitly confirm "negative = debit" anywhere in the public reference.
+  This mapping assumes the near-universal convention; it needs verifying
+  against a live sandbox before this ships, same as the rest of this file.
+- **`id_cluster`.** Powens' transaction object has a field described only as
+  "if the transaction is part of a cluster" — which reads like it could be
+  Powens' own recurring-transaction grouping, but the docs don't say so
+  explicitly. Rather than build on an unconfirmed feature, the detector does
+  its own grouping and ignores `id_cluster` entirely. Worth a cross-check
+  against real data later, not a foundation to build on now.
+
+### Wired to a caller
+
+```http
+POST /v1/customers/:id/recurring-payments/detect/powens
+{"transactions_by_account": {"<accountId>": [ /* raw Powens transactions */ ]}}
+```
+
+`BatchPipeline.detectRecurringPayments(ctx, customerId, provider, rawTransactionsByAccount)`
+normalizes each account's raw transactions, runs the detector across all of
+them, and persists the result with `store.putRecurringPayments` — deliberately
+per-customer rather than per-batch, since transaction volume dwarfs account
+volume and a caller should choose which customers are worth the fetch rather
+than this pipeline fetching every customer's full history unconditionally.
+Once persisted, nothing else needs wiring: `MigrationService` already reads
+`store.listRecurringPayments` when it builds a plan, so a customer planned
+after this call sees the detected payments exactly as if they had been
+imported by hand. Verified against a live server: `POST .../detect/powens`
+against the seeded demo customer, whose plan then included the detected
+Netflix subscription alongside its hand-authored recurring payments with no
+special-casing, plus the 422s for an unknown provider and an unknown
+customer.
+
 ## Not built (deliberately)
 
 **No durable queue.** `WebhookDispatcher.drain()` is called on a timer in
@@ -466,8 +562,11 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 ### Next
 
-1. A recurring-payment detector — the input `RecurringPayment[]` still has to
-   come from somewhere; see Milestone 4.
+1. Verify the two open Powens questions flagged in Milestone 5 (the
+   transaction sign convention, and whether `id_cluster` is a usable
+   recurrence signal) against a live sandbox, and recalibrate the
+   detector's thresholds against real transaction data rather than
+   hand-built fixtures once that's possible.
 2. If the remaining ~7s on a 500-customer Postgres plan matters at real
    volume: batch *across* customers, not just within one — deliberately not
    done yet, because it trades away the per-customer transaction isolation

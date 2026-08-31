@@ -1,4 +1,4 @@
-import type { FinancialProduct } from '../domain/types.js';
+import type { FinancialProduct, Transaction } from '../domain/types.js';
 
 /**
  * The boundary the brief's §5 connectivity abstraction actually means: every
@@ -21,6 +21,21 @@ export interface ConnectivityProvider {
     raw: unknown[],
     ctx: { customerId: string; institutionId: string; fetchedAt?: string },
   ): NormalizationResult;
+  /**
+   * Optional: not every provider integration needs transaction history, and
+   * not every provider this engine will ever talk to exposes it the same
+   * way accounts are exposed. Present for providers that support recurring-
+   * payment detection (§20-adjacent — see `src/detection/recurring.ts`).
+   */
+  normalizeTransactions?(
+    raw: unknown[],
+    ctx: { customerId: string; accountId: string },
+  ): TransactionNormalizationResult;
+}
+
+export interface TransactionNormalizationResult {
+  transactions: Transaction[];
+  skipped: { externalTransactionId: string; reason: string }[];
 }
 
 export interface NormalizationResult {

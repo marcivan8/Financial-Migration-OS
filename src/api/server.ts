@@ -291,6 +291,36 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     return reply.code(201).send({ consent_id: customer.consent.id, scopes: customer.consent.scopes });
   });
 
+  app.post('/v1/customers/:id/recurring-payments/detect/:provider', async (req) => {
+    const { id, provider: providerId } = req.params as { id: string; provider: string };
+    await guard(req, 'customers:write', 'customer', id);
+    const provider = CONNECTIVITY_PROVIDERS[providerId];
+    if (!provider) {
+      throw new ValidationError(
+        `Unknown connectivity provider "${providerId}". Expected one of: ${Object.keys(CONNECTIVITY_PROVIDERS).join(', ')}`,
+        'provider',
+      );
+    }
+    const body = req.body as { transactions_by_account?: Record<string, unknown[]> };
+    if (!body?.transactions_by_account || typeof body.transactions_by_account !== 'object') {
+      throw new ValidationError('transactions_by_account is required', 'transactions_by_account');
+    }
+
+    const { detected, skippedTransactions } = await batches.detectRecurringPayments(
+      req.ctx,
+      id,
+      provider,
+      body.transactions_by_account,
+    );
+    return {
+      customer_id: id,
+      provider: provider.id,
+      detected: detected.length,
+      recurring_payments: detected,
+      skipped_transactions: skippedTransactions,
+    };
+  });
+
   // -------------------------------------------------------------------------
   // Migrations
   // -------------------------------------------------------------------------

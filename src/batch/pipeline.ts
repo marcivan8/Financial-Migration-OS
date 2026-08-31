@@ -3,10 +3,12 @@ import type {
   Customer,
   FinancialProduct,
   RecurringPayment,
+  Transaction,
 } from '../domain/types.js';
 import type { BatchRecord, MigrationStore, TenantContext } from '../store/types.js';
 import { MigrationService, newId, ValidationError } from '../api/service.js';
 import type { ConnectivityProvider, SkippedAccount } from '../connectivity/types.js';
+import { detectRecurringPayments as runRecurringDetection } from '../detection/recurring.js';
 
 /**
  * Mass institutional migration (§20 of the brief).
@@ -52,6 +54,12 @@ export interface ProviderImportResult {
   failures: BatchFailure[];
   /** Accounts the provider returned that no product type could be assigned to — reported, not dropped. */
   skippedAccounts: (SkippedAccount & { customerId: string; externalRef: string })[];
+}
+
+export interface RecurringPaymentDetectionResult {
+  customerId: string;
+  detected: RecurringPayment[];
+  skippedTransactions: { externalTransactionId: string; reason: string; accountId: string }[];
 }
 
 export interface BatchFailure {
@@ -285,6 +293,55 @@ export class BatchPipeline {
     });
 
     return { imported, failures, skippedAccounts };
+  }
+
+  /**
+   * Run recurring-payment detection (`detection/recurring.ts`) for one
+   * customer against a provider's raw transaction history, and persist what
+   * it finds. Deliberately per-customer rather than per-batch: transaction
+   * volume is much larger than account volume, and a caller decides which
+   * customers in a batch are worth the fetch (a fresh import, say, or one
+   * flagged for re-detection) rather than this pipeline fetching every
+   * customer's full history unconditionally.
+   *
+   * Once persisted, this needs no further wiring: `MigrationService`
+   * already calls `store.listRecurringPayments` when it builds a plan (see
+   * `api/service.ts`), so a customer planned after this call sees the
+   * detected payments — and a low-confidence one routes into the planner's
+   * existing `LOW_CONFIDENCE_RECURRING_PAYMENT` exception — exactly as if
+   * they had been imported by hand.
+   */
+  async detectRecurringPayments(
+    ctx: TenantContext,
+    customerId: string,
+    provider: ConnectivityProvider,
+    rawTransactionsByAccount: Record<string, unknown[]>,
+  ): Promise<RecurringPaymentDetectionResult> {
+    if (!provider.normalizeTransactions) {
+      throw new ValidationError(
+        `${provider.id} does not support transaction history`,
+        'provider',
+      );
+    }
+    const customer = await this.store.getCustomer(ctx, customerId);
+    if (!customer) throw new ValidationError(`Unknown customer ${customerId}`, 'customer_id');
+
+    const transactions: Transaction[] = [];
+    const skippedTransactions: RecurringPaymentDetectionResult['skippedTransactions'] = [];
+
+    for (const [accountId, raw] of Object.entries(rawTransactionsByAccount)) {
+      const { transactions: normalized, skipped } = provider.normalizeTransactions(raw, {
+        customerId,
+        accountId,
+      });
+      transactions.push(...normalized);
+      for (const s of skipped) skippedTransactions.push({ ...s, accountId });
+    }
+
+    const detected = runRecurringDetection(transactions);
+    await this.store.putRecurringPayments(ctx, detected);
+
+    return { customerId, detected, skippedTransactions };
   }
 
   /** Plan every imported customer in bounded-concurrency chunks. */

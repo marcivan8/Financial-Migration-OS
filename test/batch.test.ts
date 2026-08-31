@@ -7,6 +7,7 @@ import { money } from '../src/domain/types.js';
 import { freshStore, closeTestStore } from './testStore.js';
 import { PowensProvider } from '../src/connectivity/powens.js';
 import { POWENS_SAMPLE_ACCOUNTS } from '../src/connectivity/fixtures/powens-sample.js';
+import { POWENS_SAMPLE_TRANSACTIONS } from '../src/connectivity/fixtures/powens-transactions-sample.js';
 
 let w: Wiring;
 let seed: SeedResult;
@@ -152,6 +153,52 @@ describe('provider import (Powens)', () => {
     expect(result.imported).toHaveLength(2);
     expect(result.failures).toHaveLength(1);
     expect(result.failures[0]!.externalRef).toBe('EXT-2');
+  });
+});
+
+describe('recurring-payment detection (Powens)', () => {
+  it('detects, persists, and feeds a plan without any further wiring', async () => {
+    const batch = await newBatch();
+    const { imported } = await w.batches.importFromProvider(ctx, batch.id, PowensProvider, [
+      { externalRef: 'EXT-1', firstName: 'Client1', lastName: 'Martin', dateOfBirth: '1990-01-01', rawAccounts: POWENS_SAMPLE_ACCOUNTS },
+    ]);
+    const customerId = imported[0]!;
+
+    const result = await w.batches.detectRecurringPayments(ctx, customerId, PowensProvider, {
+      '9001': POWENS_SAMPLE_TRANSACTIONS,
+    });
+
+    // Three monthly Netflix debits in the fixture, nothing else.
+    expect(result.detected).toHaveLength(1);
+    expect(result.detected[0]!.merchant).toBe('Netflix');
+    expect(result.skippedTransactions).toHaveLength(2); // pending + deleted
+
+    const stored = await w.store.listRecurringPayments(ctx, customerId);
+    expect(stored).toHaveLength(1);
+
+    // No new plumbing needed downstream: createMigration already reads
+    // whatever recurring payments are on file for the customer (see
+    // api/service.ts). Three clean monthly Netflix debits clear the
+    // planner's confidence threshold, so this plans as a verified payment,
+    // not a manual-review exception.
+    const { plan } = await w.service.createMigration(ctx, {
+      customerId,
+      destinationInstitutionId: seed.destinationId,
+    });
+    const recurringItem = plan.items.find((i) => i.productType === undefined);
+    expect(recurringItem).toBeDefined();
+    expect(recurringItem!.taskIds.length).toBeGreaterThan(0);
+    expect(plan.exceptions.some((e) => e.code === 'LOW_CONFIDENCE_RECURRING_PAYMENT')).toBe(false);
+  });
+
+  it('rejects a provider that does not support transaction history', async () => {
+    const batch = await newBatch();
+    const { imported } = await w.batches.importRows(ctx, batch.id, [row(1)]);
+    const noTransactionsProvider = { id: 'stub', normalizeAccounts: PowensProvider.normalizeAccounts };
+
+    await expect(
+      w.batches.detectRecurringPayments(ctx, imported[0]!, noTransactionsProvider, {}),
+    ).rejects.toThrow(/does not support transaction history/);
   });
 });
 
