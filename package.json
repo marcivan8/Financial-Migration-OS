@@ -1,0 +1,25 @@
+{
+  "name": "@fmos/migration-engine",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Financial Migration OS — deterministic migration engine + enterprise API (FR)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "demo": "tsx src/cli.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "serve": "tsx src/serve.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "fastify": "^5.12.1"
+  }
+}
