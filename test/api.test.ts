@@ -709,4 +709,28 @@ describe('exception lifecycle (regressions)', () => {
     // empty queue and a migration that can never move.
     expect(after.find((t) => t.id === target.id)!.status).not.toBe('BLOCKED');
   });
+
+  it('accepts inbound Powens webhooks without authentication', async () => {
+    const postRes = await app.inject({
+      method: 'POST',
+      url: '/webhooks/powens',
+      payload: { event: 'connection.synced', id_user: 1234, id_connection: 5678 },
+    });
+    expect(postRes.statusCode).toBe(200);
+    expect(postRes.json()).toEqual({ received: true });
+
+    const getRes = await app.inject({
+      method: 'GET',
+      url: '/webhooks/powens',
+    });
+    expect(getRes.statusCode).toBe(200);
+    expect(getRes.json().provider).toBe('powens');
+
+    const cbRes = await app.inject({
+      method: 'GET',
+      url: '/callback?connection_id=5678',
+    });
+    expect(cbRes.statusCode).toBe(200);
+    expect(cbRes.json().status).toBe('ok');
+  });
 });

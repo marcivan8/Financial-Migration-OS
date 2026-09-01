@@ -62,7 +62,7 @@ declare module 'fastify' {
   }
 }
 
-const PUBLIC_ROUTES = new Set(['/health', '/', '/favicon.ico']);
+const PUBLIC_ROUTES = new Set(['/health', '/', '/favicon.ico', '/webhooks/powens', '/callback']);
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
   const app = Fastify({ logger: false });
@@ -571,6 +571,31 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
     await guard(req, 'webhooks:manage', 'webhook_delivery');
     return await webhooks.drain();
   });
+
+  // -------------------------------------------------------------------------
+  // Powens Inbound Webhook & Callback
+  // -------------------------------------------------------------------------
+
+  app.get('/webhooks/powens', async () => ({ status: 'ok', provider: 'powens' }));
+
+  app.post('/webhooks/powens', async (req, reply) => {
+    const payload = req.body as Record<string, unknown> | undefined;
+    await store.audit({
+      tenantId: 'system',
+      action: 'POST /webhooks/powens',
+      resourceType: 'webhook_inbound',
+      outcome: 'ALLOWED',
+      detail: payload ?? {},
+      occurredAt: new Date().toISOString(),
+    });
+    return reply.code(200).send({ received: true });
+  });
+
+  app.get('/callback', async (req) => ({
+    status: 'ok',
+    message: 'Powens callback received',
+    params: req.query,
+  }));
 
   // -------------------------------------------------------------------------
   // Batches
