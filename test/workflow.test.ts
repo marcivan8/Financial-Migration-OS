@@ -97,6 +97,62 @@ describe('task execution guards', () => {
     expect(blocked.length).toBeGreaterThan(0);
     expect(m.events.some((e) => e.type === 'ExceptionRaised')).toBe(true);
   });
+
+  it('reports WAITING_EXTERNAL over IN_PROGRESS when nothing is blocked but something is waiting on a third party', () => {
+    // Isolates the middle tier of reconcileState's priority order. The
+    // "blocked outranks everything" test above only proves the top tier;
+    // this proves that with nothing BLOCKED, one WAITING_EXTERNAL task
+    // still outranks any number of ordinary IN_PROGRESS ones, rather than
+    // the migration reading as merely "in progress" while it is actually
+    // stalled on a third party.
+    const plan = makePlan();
+    const m = new Migration(plan);
+    m.transitionTo('DATA_CONNECTED');
+    m.transitionTo('ANALYZED');
+    m.transitionTo('PLAN_GENERATED');
+
+    // Drain normally — completing everything as it becomes ready, so the
+    // graph actually reaches a branch that waits on a third party — and
+    // only once a WAITING_EXTERNAL task has appeared do we hold one more
+    // ordinary task open instead of completing it. Holding one back from
+    // the very start risks it gating the only path to a WAITING_EXTERNAL
+    // task in the first place; holding one back after we've already seen
+    // one avoids that.
+    let heldBack: string | undefined;
+    let sawWaiting = false;
+    let guard = 0;
+    while (guard++ < 500) {
+      const ready = m.ready();
+      if (ready.length === 0) break;
+      for (const task of ready) {
+        m.startTask(task.id);
+        const status = m.tasks.find((t) => t.id === task.id)!.status;
+        if (status === 'WAITING_EXTERNAL') {
+          sawWaiting = true;
+          continue; // let a real wait sit and wait
+        }
+        if (task.type === 'CUSTOMER_AUTHORIZATION') {
+          m.completeTask(task.id);
+          continue;
+        }
+        if (sawWaiting && !heldBack) {
+          // An ordinary task nobody has finished yet — left IN_PROGRESS,
+          // alongside the wait that's already in flight elsewhere.
+          heldBack = task.id;
+          continue;
+        }
+        m.completeTask(task.id);
+      }
+      if (heldBack) break;
+    }
+
+    expect(heldBack).toBeDefined();
+    const statuses = m.tasks.map((t) => t.status);
+    expect(statuses).toContain('IN_PROGRESS');
+    expect(statuses).toContain('WAITING_EXTERNAL');
+    expect(statuses).not.toContain('BLOCKED');
+    expect(m.state).toBe('WAITING_EXTERNAL');
+  });
 });
 
 describe('completion scoring', () => {

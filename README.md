@@ -24,7 +24,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 127 tests with no infrastructure running (131 with Postgres and Redis both up — see Milestones 6 and 7)
+npm test                      # 128 tests with no infrastructure running (133 with Postgres and Redis both up — see Milestones 6 and 7)
 ```
 
 Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
@@ -278,7 +278,7 @@ explicit theme stamp.
 
 ```bash
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run db:migrate  # once
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 127 tests plus 1 Postgres-only, real Postgres
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 128 tests plus 2 Postgres-only, real Postgres
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run serve       # data survives a restart
 ```
 
@@ -352,7 +352,11 @@ more than one migration — and one only showed up against a real database:
 1. **Nothing ever entered `IN_PROGRESS`.** A blocked task could not escalate, so
    a stalled PEA read as "authorized, all fine" on the dashboard. Fixed by
    deriving state from the task set, with blocked outranking waiting outranking
-   progressing.
+   progressing. The top tier (blocked outranks everything) had a direct test
+   from the start; the middle tier (waiting outranks progressing) didn't — it
+   was only implied by tests that happened to also be blocked. `test/workflow.test.ts`
+   now isolates it with a case that has one task genuinely `WAITING_EXTERNAL`
+   and another left `IN_PROGRESS`, nothing `BLOCKED`.
 2. **Task, plan-item and exception ids collided across migrations.** The planner
    minted `tsk_0001` for every customer, so in a shared store one migration
    served its neighbour's task statuses — and rehydration skipped work that was
@@ -381,7 +385,15 @@ more than one migration — and one only showed up against a real database:
    Postgres.** Covered above (Milestone 3) — the in-memory store has no
    referential integrity to violate, so 92 of the suite's 99 tests passed
    against it while this was live; the other seven, all denial paths, only
-   failed once the same suite ran against Postgres for the first time.
+   failed once the same suite ran against Postgres for the first time. Those
+   seven still only prove anything if someone runs the suite with
+   `DATABASE_URL` set — nothing forced that the way Milestone 6 and 7's
+   `it.skipIf` tests do for their own Postgres/Redis-only claims.
+   `test/api.test.ts` now has one: `it.skipIf(!usingPostgres)` calling
+   `store.audit()` for a tenant id that was never seeded and asserting it
+   doesn't throw. Deleting the `ensureTenant()` call it guards reproduces the
+   original bug exactly — `audit_log_tenant_id_fkey` violated — which is how
+   the test was checked.
 
 ## Milestone 4 — connectivity
 
@@ -557,7 +569,7 @@ customer.
 ## Milestone 6 — batching customer writes across a batch
 
 ```bash
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test   # 128 tests — 1 is Postgres-only, see below
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test   # 130 tests — 2 are Postgres-only, see below
 ```
 
 The deferred half of Milestone 3's throughput work: `importRows` and
@@ -608,7 +620,7 @@ to reject it), which is why the test is guarded rather than universal.
 
 ```bash
 REDIS_URL=redis://localhost:6379 npm run serve   # durable schedule instead of setInterval
-npm test                                          # 131 tests — 3 are Redis-only, see below
+npm test                                          # 133 tests — 3 are Redis-only, see below
 ```
 
 `WebhookDispatcher.drain()` used to be called from a bare `setInterval` in

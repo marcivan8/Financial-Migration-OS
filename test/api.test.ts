@@ -78,6 +78,36 @@ describe('authentication', () => {
     expect(res.json().code).toBe('revoked_credentials');
   });
 
+  it.skipIf(!usingPostgres)(
+    "audits a denial under a tenant id nobody issued without tripping audit_log's foreign key",
+    async () => {
+      // Regression test for bug 6 in the README's "Six bugs the build
+      // surfaced": audit_log.tenant_id has a real FK to tenants, and a
+      // denied request is audited under whatever tenant id the caller
+      // claimed — including a forged key or the "unknown" sentinel for no
+      // credentials at all, neither of which has a tenants row. The three
+      // denial tests above assert the same 401s but pass trivially against
+      // the in-memory store, which has no FK to violate in the first
+      // place — this is the one that only means something run against
+      // real Postgres, so it stays skipIf(!usingPostgres) rather than
+      // silently green with nothing checked, the same way Milestone 6's
+      // batch.test.ts guards its own Postgres-only regression.
+      const bogusTenantId = `ten_never_seeded_${Math.random().toString(16).slice(2)}`;
+      await expect(
+        w.store.audit({
+          tenantId: bogusTenantId,
+          action: 'migration.list',
+          resourceType: 'migration',
+          outcome: 'DENIED',
+          occurredAt: new Date().toISOString(),
+        }),
+      ).resolves.not.toThrow();
+
+      const entries = await w.store.listAudit({ tenantId: bogusTenantId }, 10);
+      expect(entries.some((e) => e.outcome === 'DENIED')).toBe(true);
+    },
+  );
+
   it('never stores the plaintext key', () => {
     const issued = w.keys.issue({ tenantId: seed.tenantId, name: 'x', role: 'ADMIN' });
     expect(issued.record).not.toHaveProperty('plaintext');
