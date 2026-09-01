@@ -744,6 +744,11 @@ written for this milestone for that reason: the existing coverage already
 exercises exactly the property that would break if `prepareMigration` and
 `createMigration` drifted, and it's Postgres-backed, not in-memory.
 
+**(Superseded by Milestone 10, below: `prepareMigration` and
+`createMigration` no longer run parallel copies of validate/plan/simulate —
+they share one implementation now, so there is nothing left for the two to
+drift on.)**
+
 **Measured, not assumed**: 500 imported customers, `planBatch({ concurrency:
 40 })`, same fixture population `seedPopulation` uses, against the same
 Postgres instance — **~9.4s calling `service.createMigration` once per
@@ -828,6 +833,55 @@ a manual run, not a script kept in the repo (nothing here changes what's
 committed) — recorded so the claim is "verified this way," not "should
 work."
 
+## Milestone 10 — one validate/plan/simulate implementation, not two
+
+```bash
+npm test                                                            # 134 tests, unchanged
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test     # same 134, real Postgres
+```
+
+Milestone 8's tradeoff, made explicit at the time: `prepareMigration` and
+`createMigration` each ran their own copy of the same validate → read →
+plan → simulate-`CONNECT_ORIGIN`/`CLASSIFY_PRODUCTS`-to-completion sequence,
+because reconciling `persist()`'s live-`Migration`-instance signature
+(`authorize`, `advanceTask`, `simulate` and `resolveException` all still
+depend on it) with `prepareMigration`'s plain `PreparedMigration` snapshot
+looked like it would risk more than duplicating roughly ninety lines was
+costing. It kept costing something real, though: two implementations that
+had to keep agreeing on what "a freshly planned migration" looks like for
+the same input, with nothing but the shared test suite to notice if they
+ever stopped.
+
+**They don't duplicate it anymore.** `MigrationService.validateAndPlan` —
+private, new — is the one implementation: idempotency check, customer and
+institution reads, consent check, planning, and the `CONNECT_ORIGIN`/
+`CLASSIFY_PRODUCTS` completion simulation, in one place. It returns either
+`{ kind: 'existing', record, plan }` when the idempotency key already
+resolved, or `{ kind: 'new', plan, migration }` — the live `Migration`
+instance, not a snapshot. `prepareMigration` calls it and snapshots the
+result into a `PreparedMigration`, exactly as it always did downstream of
+its own copy of this logic. `createMigration` calls it and hands the live
+`migration` straight to `persist()`, exactly as it always did downstream of
+its own copy. **What did not change is the actual risk Milestone 8 was
+avoiding**: the two write paths — `store.createMigration` +
+`persist()` + `updateMigration` for a single migration,
+`store.createMigrations` + chunked webhook publish for a batch — stay
+completely separate, each still doing what it always did with the plan and
+migration `validateAndPlan` hands it. Only the part that had no reason to
+differ between them was ever duplicated, and only that part was unified.
+
+**Proof this didn't change behavior, not just that it compiles.** No new
+test was written, for the same reason Milestone 8 didn't write one: the
+existing suite already exercises exactly the property that would break if
+the two paths disagreed after this change — `test/batch.test.ts`'s
+`planBatch` coverage (count assertions, idempotent re-planning, per-customer
+failure isolation, blocking counts, exceptions read back) and
+`test/api.test.ts`'s single-migration coverage (lifecycle, idempotent
+retries, exception resolution, the two-concurrent-`drain()` regression) —
+run unmodified against both the in-memory store and real Postgres, all 134
+passing both ways. `git diff --stat` on this milestone touches exactly one
+file, `src/api/service.ts` — no test, no store adapter, no route.
+
 ## Not built (deliberately)
 
 **No customer-facing surface**, no document AI, no ops copilot. The AI layer
@@ -840,10 +894,5 @@ from §15 consumes this output; none of it belongs in the decision path.
    recurrence signal) against a live sandbox, and recalibrate the
    detector's thresholds against real transaction data rather than
    hand-built fixtures once that's possible.
-2. `prepareMigration` duplicates `createMigration`'s validate/plan/simulate
-   logic rather than sharing it (Milestone 8's tradeoff) — worth collapsing
-   into one implementation if the two ever drift, which would show up as
-   `planBatch` and `POST /v1/migrations` disagreeing about what a freshly
-   planned migration looks like for the same input.
-3. Get the rule catalog in front of counsel before anything above is built on
+2. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
