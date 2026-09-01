@@ -812,6 +812,22 @@ from the in-memory one) it fails the same way on both — 40 posts recorded
 for 20 deliveries, exactly the double-post this milestone exists to
 prevent.
 
+**Also proven live, as two real processes, not just one process calling
+`drain()` twice.** The unit test above shares a single Node event loop
+between both `drain()` calls — a fair test of the store's claim step, but
+not of what this milestone actually exists for: a second worker *process*
+against the same Redis. Two independent `node` processes were started, each
+with its own `PostgresStore` connection, its own `WebhookDispatcher`, and
+its own `createDrainQueue` (`concurrency: 5` each — ten sweeps in flight at
+once, not one), both pointed at the same real Postgres and the same real
+Redis, draining 60 queued deliveries to a receiver with an artificial delay
+to widen the race window further than the unit test's does. Result: 60
+POSTs received, 60 unique delivery ids, zero duplicates — confirmed against
+`webhook_deliveries` itself, which showed all 60 rows `DELIVERED`. This was
+a manual run, not a script kept in the repo (nothing here changes what's
+committed) — recorded so the claim is "verified this way," not "should
+work."
+
 ## Not built (deliberately)
 
 **No customer-facing surface**, no document AI, no ops copilot. The AI layer
@@ -829,9 +845,5 @@ from §15 consumes this output; none of it belongs in the decision path.
    into one implementation if the two ever drift, which would show up as
    `planBatch` and `POST /v1/migrations` disagreeing about what a freshly
    planned migration looks like for the same input.
-3. Actually run more than one webhook worker process against the same
-   Redis and Postgres under load (Milestone 9 proved the claim step with a
-   concurrent-`drain()` unit test, not a live multi-process deployment) —
-   worth doing before relying on it in production.
-4. Get the rule catalog in front of counsel before anything above is built on
+3. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
