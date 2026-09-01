@@ -79,6 +79,19 @@ function valuesPlaceholders(rowCount: number, colCount: number): string {
   return rows.join(',');
 }
 
+/**
+ * How long a claimed webhook delivery stays claimed before `listDueDeliveries`
+ * treats it as abandoned and offers it up again. Long enough that a normal
+ * `drain()` sweep — one HTTP POST per due delivery, a handful of milliseconds
+ * to a few seconds each — comfortably finishes and calls `updateDelivery`
+ * (which clears the claim) well within it; short enough that a worker that
+ * crashed mid-sweep doesn't strand a delivery for long. Not a knob exposed on
+ * `MigrationStore` — this is an adapter-internal recovery detail, the same
+ * way `IMPORT_CHUNK_SIZE` is internal to `BatchPipeline` rather than a port
+ * concern.
+ */
+const CLAIM_TIMEOUT_MS = 60_000;
+
 function pgError(err: unknown): Error {
   const e = err as { code?: string; message?: string };
   if (e?.code === '23505') return new ConflictError(e.message ?? 'unique constraint violated');
@@ -1067,15 +1080,40 @@ export class PostgresStore implements MigrationStore {
     });
   }
 
-  /** Cross-tenant by contract — see the class doc and db/migrations/0003. */
+  /**
+   * Cross-tenant by contract — see the class doc and db/migrations/0003.
+   *
+   * Claims what it selects, in the same statement: `FOR UPDATE SKIP LOCKED`
+   * inside the CTE means a second concurrent call — another BullMQ Worker
+   * slot, or an entirely separate worker process against the same Redis —
+   * skips whatever this one is holding rather than selecting it too, and
+   * the `UPDATE ... SET claimed_at` that follows marks it claimed for
+   * anyone who asks after this transaction commits and the row lock
+   * releases. `updateDelivery` clears `claimed_at` back to NULL when it
+   * records an outcome; a claim older than `CLAIM_TIMEOUT_MS` without one is
+   * treated as abandoned (a crashed worker) and becomes selectable again —
+   * see README Milestone 9 for why this replaced the fixed-concurrency-1
+   * workaround.
+   */
   async listDueDeliveries(now: string, limit: number): Promise<WebhookDelivery[]> {
+    const staleClaimBefore = new Date(new Date(now).getTime() - CLAIM_TIMEOUT_MS).toISOString();
     return this.workerTx(async (c) => {
       const { rows } = await c.query(
-        `SELECT * FROM webhook_deliveries
-         WHERE status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
-         ORDER BY next_attempt_at NULLS FIRST
-         LIMIT $2`,
-        [now, limit],
+        `WITH due AS (
+           SELECT id FROM webhook_deliveries
+           WHERE status = 'PENDING'
+             AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+             AND (claimed_at IS NULL OR claimed_at <= $2)
+           ORDER BY next_attempt_at NULLS FIRST
+           LIMIT $3
+           FOR UPDATE SKIP LOCKED
+         )
+         UPDATE webhook_deliveries
+         SET claimed_at = $1
+         FROM due
+         WHERE webhook_deliveries.id = due.id
+         RETURNING webhook_deliveries.*`,
+        [now, staleClaimBefore, limit],
       );
       return rows.map(rowToDelivery);
     });
@@ -1086,7 +1124,7 @@ export class PostgresStore implements MigrationStore {
       await c.query(
         `UPDATE webhook_deliveries SET
            status = $2, attempts = $3, next_attempt_at = $4, last_status_code = $5,
-           last_error = $6, delivered_at = $7
+           last_error = $6, delivered_at = $7, claimed_at = NULL
          WHERE id = $1`,
         [
           delivery.id,

@@ -92,10 +92,19 @@ describe.skipIf(!REDIS_URL)('webhook drain queue (Redis/BullMQ)', () => {
     await second.close();
   });
 
-  it('is deliberately single-concurrency — see queue.ts for why', async () => {
+  it('defaults to single-concurrency, but a caller can now raise it — see queue.ts for why that became safe', async () => {
     const store = new InMemoryStore();
     const dispatcher = new WebhookDispatcher(store);
     handle = createDrainQueue(REDIS_URL!, dispatcher);
     expect(handle.worker.opts.concurrency).toBe(1);
+
+    const second = createDrainQueue(REDIS_URL!, dispatcher, { concurrency: 4 });
+    expect(second.worker.opts.concurrency).toBe(4);
+    // createDrainQueue fires upsertJobScheduler without awaiting it (see
+    // queue.ts); give it a chance to land before closing the connection it
+    // needs, the same way the "registers exactly one..." test above does
+    // incidentally via its own getJobSchedulers() call.
+    await second.queue.getJobSchedulers();
+    await second.close();
   });
 });

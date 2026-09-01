@@ -31,6 +31,18 @@ export interface DrainQueueOptions {
   intervalMs?: number;
   /** Passed straight through to `WebhookDispatcher.drain()`. */
   limit?: number;
+  /**
+   * BullMQ Worker concurrency — how many `drain()` sweeps this Worker runs
+   * at once. Defaults to 1, which is still a perfectly reasonable default at
+   * most volumes; raising it is now safe (Milestone 9) because the store's
+   * `listDueDeliveries` claims what it selects — `SELECT ... FOR UPDATE SKIP
+   * LOCKED` in the same statement that marks a row claimed — so two
+   * concurrent sweeps, whether both from this Worker's own concurrency or
+   * from a second worker *process* pointed at the same Redis, can no longer
+   * both pick the same due delivery. This option exists to make that
+   * headroom usable, not to change the default.
+   */
+  concurrency?: number;
 }
 
 export interface DrainQueueHandle {
@@ -46,19 +58,12 @@ export interface DrainQueueHandle {
  * pattern `DATABASE_URL` already uses to switch the storage adapter, so a
  * bare `npm run serve` stays a zero-dependency demo.
  *
- * Concurrency is deliberately fixed at 1 and is not a constructor option.
- * `listDueDeliveries` and `updateDelivery` are two separate transactions
- * with nothing claiming a row in between them, so two `drain()` sweeps
- * running at once — whether from Worker concurrency here or a second
- * worker process pointed at the same Redis — can both pick the same due
- * delivery and both POST it. Receivers are already expected to tolerate
- * that (`fmos-idempotency-key` in dispatcher.ts — at-least-once delivery,
- * by design), so this is wasted work, not a correctness bug, but true
- * horizontal scaling — more than one worker process — would need a claim
- * step added to the store first (`SELECT ... FOR UPDATE SKIP LOCKED`,
- * marking a row claimed in the same transaction it's selected in). Not
- * built here: this swap's job is matching `setInterval`'s behaviour
- * durably, not changing it.
+ * Concurrency defaults to 1 but is a real option now (`DrainQueueOptions`,
+ * above) — see there for why raising it, or running a second worker process
+ * against the same Redis, is safe as of Milestone 9. Before that milestone
+ * this was hard-coded and undocumented-as-a-limit-not-an-oversight; the
+ * store's claim step is what changed, not anything in this file's own
+ * logic.
  */
 export function createDrainQueue(
   redisUrl: string,
@@ -79,7 +84,7 @@ export function createDrainQueue(
   const worker = new Worker(
     QUEUE_NAME,
     async () => dispatcher.drain(limit),
-    { connection: workerConnection, concurrency: 1 },
+    { connection: workerConnection, concurrency: options.concurrency ?? 1 },
   );
 
   // Registered on every boot; upsertJobScheduler is idempotent on

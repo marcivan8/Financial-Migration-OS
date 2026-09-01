@@ -24,7 +24,7 @@ npm run demo -- --simulate    # also walk the workflow and score completion
 npm run demo -- --blocked     # same customer, destination with no securities desk
 npm run demo -- --json        # machine-readable plan
 npm run serve -- --populate   # boot the API with a 120-customer batch + dashboard
-npm test                      # 128 tests with no infrastructure running (133 with Postgres and Redis both up — see Milestones 6 and 7)
+npm test                      # 129 tests with no infrastructure running (134 with Postgres and Redis both up — see Milestones 6, 7 and 9)
 ```
 
 Set `DATABASE_URL` to run any of `test`/`serve` against real Postgres instead —
@@ -278,7 +278,7 @@ explicit theme stamp.
 
 ```bash
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run db:migrate  # once
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 128 tests plus 2 Postgres-only, real Postgres
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test            # same 129 tests plus 2 Postgres-only, real Postgres
 DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm run serve       # data survives a restart
 ```
 
@@ -569,7 +569,7 @@ customer.
 ## Milestone 6 — batching customer writes across a batch
 
 ```bash
-DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test   # 130 tests — 2 are Postgres-only, see below
+DATABASE_URL=postgres://fmos:<password>@localhost/fmos npm test   # 131 tests — 2 are Postgres-only, see below
 ```
 
 The deferred half of Milestone 3's throughput work: `importRows` and
@@ -620,7 +620,7 @@ to reject it), which is why the test is guarded rather than universal.
 
 ```bash
 REDIS_URL=redis://localhost:6379 npm run serve   # durable schedule instead of setInterval
-npm test                                          # 133 tests — 3 are Redis-only, see below
+npm test                                          # 134 tests — 3 are Redis-only, see below
 ```
 
 `WebhookDispatcher.drain()` used to be called from a bare `setInterval` in
@@ -664,7 +664,9 @@ horizontal scaling needs a claim step added to the store first
 (`SELECT ... FOR UPDATE SKIP LOCKED`, marking a row claimed in the same
 transaction it's selected in) — not built here, because this milestone's
 job was matching the timer's behaviour durably, not changing its
-concurrency model.
+concurrency model. **(Superseded by Milestone 9, below: the claim step
+described as future work here is what that milestone built, and
+`concurrency` stopped being hard-coded.)**
 
 **`test/webhookQueue.test.ts` needs a real Redis**, the same reasoning as
 Milestone 6's Postgres-only test: the thing worth proving is that a real
@@ -756,6 +758,60 @@ hit — the same tradeoff call this Next list has made since Milestone 6:
 batch what's expensive, leave what already runs once per customer for a
 reason.
 
+## Milestone 9 — a claim step for webhook workers
+
+```bash
+npm test   # 134 tests — 2 are Postgres-only, 3 are Redis-only, see below
+```
+
+Milestone 7 fixed the BullMQ Worker's concurrency at 1 and said so plainly:
+`listDueDeliveries` and `updateDelivery` were two separate transactions with
+nothing marking a row claimed in between, so two concurrent `drain()`
+sweeps — whether from raising that concurrency or from a second worker
+*process* pointed at the same Redis — could both select and both POST the
+same due delivery. Not a correctness bug (receivers already have to
+tolerate at-least-once delivery, `fmos-idempotency-key` in
+`dispatcher.ts`), but wasted work, and a real ceiling on throughput at
+volumes where one worker's concurrency-1 sweep can't keep up.
+
+**`listDueDeliveries` now claims what it selects, in the same statement.**
+On Postgres: a CTE does `SELECT ... FOR UPDATE SKIP LOCKED`, and the
+`UPDATE ... SET claimed_at` that follows marks the row claimed before the
+transaction commits and the lock releases — a second concurrent call skips
+whatever the first is holding rather than reading it too
+(`db/migrations/0004_webhook_claim.sql`). `updateDelivery` clears
+`claimed_at` back to `NULL` when it records an outcome, so a delivery
+scheduled for retry is claimable again the moment its `next_attempt_at`
+arrives, not after some separate cooldown. A claim that's never cleared —
+the worker that made it crashed mid-sweep — is treated as abandoned once it
+outlives `CLAIM_TIMEOUT_MS` (60s: comfortably longer than a normal sweep,
+short enough that a crash doesn't strand a delivery for long) and becomes
+selectable again. `InMemoryStore` mirrors the same contract with a
+`claimedDeliveries` map rather than a column, so the port's guarantee — two
+concurrent sweeps against the same store never both pick the same
+delivery — holds for both adapters, not just Postgres.
+
+**`webhooks/queue.ts`'s `concurrency` is a real option now**, not hard-coded
+at 1: `DrainQueueOptions.concurrency`, defaulting to 1 still (a sane
+default, not a limit) but safe to raise, and safe to run a second worker
+process against the same Redis, because the race that made either
+dangerous no longer exists at the store layer where it was created.
+
+**Proven by breaking it, not just by adding it.** `test/api.test.ts` has a
+new regression test — `two concurrent drain() sweeps never both pick the
+same due delivery` — that subscribes one endpoint, creates 20 migrations
+(20 queued deliveries), and runs `Promise.all([drain(), drain()])` against
+a deliberately slow receiver to widen the race window, then asserts every
+delivery was posted exactly once. It runs against whichever store this
+file is backed by (in-memory always, Postgres too when `DATABASE_URL` is
+set), because the property under test is the port's contract, not a
+Postgres-only claim. Checked both ways: with the claim step in place it
+passes against both adapters; with it deliberately reverted (`FOR UPDATE
+SKIP LOCKED` removed from the Postgres query, the equivalent check removed
+from the in-memory one) it fails the same way on both — 40 posts recorded
+for 20 deliveries, exactly the double-post this milestone exists to
+prevent.
+
 ## Not built (deliberately)
 
 **No customer-facing surface**, no document AI, no ops copilot. The AI layer
@@ -768,13 +824,14 @@ from §15 consumes this output; none of it belongs in the decision path.
    recurrence signal) against a live sandbox, and recalibrate the
    detector's thresholds against real transaction data rather than
    hand-built fixtures once that's possible.
-2. If webhook delivery ever needs more than one worker process: add a claim
-   step to `listDueDeliveries` (Milestone 7 fixed the queue's own
-   concurrency at 1 specifically because this wasn't built).
-3. `prepareMigration` duplicates `createMigration`'s validate/plan/simulate
-   logic rather than sharing it (Milestone 8's tradeoff, above) — worth
-   collapsing into one implementation if the two ever drift, which would
-   show up as `planBatch` and `POST /v1/migrations` disagreeing about what a
-   freshly planned migration looks like for the same input.
+2. `prepareMigration` duplicates `createMigration`'s validate/plan/simulate
+   logic rather than sharing it (Milestone 8's tradeoff) — worth collapsing
+   into one implementation if the two ever drift, which would show up as
+   `planBatch` and `POST /v1/migrations` disagreeing about what a freshly
+   planned migration looks like for the same input.
+3. Actually run more than one webhook worker process against the same
+   Redis and Postgres under load (Milestone 9 proved the claim step with a
+   concurrent-`drain()` unit test, not a live multi-process deployment) —
+   worth doing before relying on it in production.
 4. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.

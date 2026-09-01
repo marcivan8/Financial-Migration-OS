@@ -42,6 +42,9 @@ type Row<T> = T & { tenantId: string };
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
+/** See `PostgresStore`'s `CLAIM_TIMEOUT_MS` — same value, same reasoning. */
+const CLAIM_TIMEOUT_MS = 60_000;
+
 export class InMemoryStore implements MigrationStore {
   private institutions = new Map<string, Row<Institution>>();
   private customers = new Map<string, Row<Customer>>();
@@ -57,6 +60,8 @@ export class InMemoryStore implements MigrationStore {
   private events: MigrationEvent[] = [];
   private endpoints = new Map<string, WebhookEndpoint>();
   private deliveries = new Map<string, WebhookDelivery>();
+  /** Delivery id → claimed-at (ms since epoch). See `listDueDeliveries`. */
+  private claimedDeliveries = new Map<string, number>();
   private batches = new Map<string, BatchRecord>();
   private auditEntries: AuditEntry[] = [];
 
@@ -365,18 +370,41 @@ export class InMemoryStore implements MigrationStore {
     this.deliveries.set(delivery.id, { ...clone(delivery), tenantId: ctx.tenantId });
   }
 
-  /** Cross-tenant by design: the delivery worker is infrastructure, not a caller. */
+  /**
+   * Cross-tenant by design: the delivery worker is infrastructure, not a
+   * caller.
+   *
+   * Claims what it selects, mirroring `PostgresStore`'s `claimed_at` column
+   * (see that store's `CLAIM_TIMEOUT_MS` comment for the full reasoning) so
+   * the two adapters agree on the property that matters: two concurrent
+   * `drain()` sweeps against the same store never both pick the same due
+   * delivery. That holds here for a genuinely single-threaded reason
+   * Postgres doesn't get for free — this method has no `await` in its body,
+   * so a call runs to completion (claiming its rows) before a second
+   * concurrent call, invoked via `Promise.all`, gets to run at all — but the
+   * *contract* the port promises is the same either way, which is what lets
+   * `test/api.test.ts`'s concurrent-drain regression test run unmodified
+   * against both adapters.
+   */
   async listDueDeliveries(now: string, limit: number): Promise<WebhookDelivery[]> {
-    return [...this.deliveries.values()]
+    const nowMs = new Date(now).getTime();
+    const due = [...this.deliveries.values()]
       .filter(
         (d) =>
           d.status === 'PENDING' && (d.nextAttemptAt === null || d.nextAttemptAt <= now),
       )
+      .filter((d) => {
+        const claimedAtMs = this.claimedDeliveries.get(d.id);
+        return claimedAtMs === undefined || nowMs - claimedAtMs > CLAIM_TIMEOUT_MS;
+      })
       .sort((a, b) => (a.nextAttemptAt ?? '').localeCompare(b.nextAttemptAt ?? ''))
       .slice(0, limit);
+    for (const d of due) this.claimedDeliveries.set(d.id, nowMs);
+    return due;
   }
 
   async updateDelivery(delivery: WebhookDelivery): Promise<void> {
+    this.claimedDeliveries.delete(delivery.id);
     this.deliveries.set(delivery.id, clone(delivery));
   }
 

@@ -388,6 +388,39 @@ describe('webhooks', () => {
     // Dead-lettered, not discarded: the institution can see and replay what it missed.
     expect(rows[0]!.attempts).toBeGreaterThanOrEqual(6);
   });
+
+  it('two concurrent drain() sweeps never both pick the same due delivery (regression, Milestone 9)', async () => {
+    // Before the claim step, listDueDeliveries and updateDelivery were two
+    // separate transactions with nothing marking a row claimed in between —
+    // two concurrent sweeps (raised Worker concurrency, or a second worker
+    // process against the same Redis) could both select and both POST the
+    // same due delivery. This runs the same regression against whichever
+    // store this file is currently backed by (see the top of this file) —
+    // in-memory always, and Postgres too when DATABASE_URL is set — because
+    // the property under test is a port contract, not a Postgres-only one.
+    await subscribe();
+    for (let i = 0; i < 20; i++) {
+      await createMigration(`wh-concurrent-${i}`);
+    }
+
+    // An artificial delay widens the window a genuine race would need —
+    // without it, two sweeps could complete too close together for even a
+    // broken claim step to visibly double-post in a fast in-memory run.
+    const seen: string[] = [];
+    const slowPoster = wire({
+      post: async (_url, _body, headers) => {
+        await new Promise((r) => setTimeout(r, 5));
+        seen.push(headers['fmos-delivery-id']!);
+        return { status: 200 };
+      },
+      store: w.store,
+    });
+
+    await Promise.all([slowPoster.webhooks.drain(50), slowPoster.webhooks.drain(50)]);
+
+    expect(seen.length).toBe(20);
+    expect(new Set(seen).size).toBe(20);
+  });
 });
 
 describe('dashboard', () => {
