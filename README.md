@@ -533,16 +533,38 @@ transaction-side counterpart to the account mapping, wired onto
 exposes transaction history the same way, or at all). Two open questions
 came out of it, called out rather than assumed away:
 
-- **Sign convention.** Powens' docs describe `value` as signed but do not
-  explicitly confirm "negative = debit" anywhere in the public reference.
-  This mapping assumes the near-universal convention; it needs verifying
-  against a live sandbox before this ships, same as the rest of this file.
-- **`id_cluster`.** Powens' transaction object has a field described only as
-  "if the transaction is part of a cluster" — which reads like it could be
-  Powens' own recurring-transaction grouping, but the docs don't say so
-  explicitly. Rather than build on an unconfirmed feature, the detector does
-  its own grouping and ignores `id_cluster` entirely. Worth a cross-check
-  against real data later, not a foundation to build on now.
+- **Sign convention — confirmed.** Verified against the real sandbox at
+  `fimios-sandbox.biapi.pro`: connected the "Connecteur de test" demo bank
+  through the actual Connect webview (not a fixture, not a mock — a real
+  OAuth-style connection, 3 accounts, 188 transactions synced by Powens
+  itself) and read the raw `value` field back. Every card purchase and
+  direct debit (`MONOPRIX`, `UBER EATS`, `FREE MOBILE`, ...) came back
+  negative; every inbound transfer (`SALAIRE`) came back positive. The
+  assumption this mapping made stands: `negative = debit`, confirmed on
+  live data, not just documentation.
+- **`id_cluster` — checked, and it's simply not populated.** All 188
+  transactions from the test connector had `id_cluster: null`, with no
+  exceptions — including four `SALAIRE` deposits per account that are
+  obviously the same recurring relationship. Whatever `id_cluster` is for,
+  this connector's synced data never sets it, so there is nothing here to
+  cross-check the detector's own grouping against. The decision to ignore
+  it stands, now for a stronger reason: not "unconfirmed," but "empty in
+  the one live sample available." A connector that does populate it, if one
+  turns up, would still be worth a second look.
+- **New finding, not one of the original two questions.** Those four
+  `SALAIRE` deposits per account are real evidence the detector doesn't
+  currently handle well: dated 05-28, 06-04, 07-30, 08-06 — gaps of 7, 56,
+  and 7 days. Coefficient of variation on that gap sequence is ~0.99, far
+  past the detector's `0.4` hard gate on interval regularity (`Milestone 5`,
+  above), so this genuine monthly salary would be *rejected* as non-recurring
+  by the current thresholds despite the sandbox itself labeling it
+  `SALAIRE`. One fixture's four data points isn't enough to justify
+  reworking a threshold that also has to keep rejecting the six-transaction
+  no-cadence grocery fixture `test/detection.test.ts` covers — but it's the
+  first real-data sign that `0.4` may be calibrated tighter than actual
+  salary cadences run, and it's worth more sandbox samples before touching
+  it. Added to the Next list below rather than changed on the strength of
+  one series.
 
 ### Wired to a caller
 
@@ -889,10 +911,12 @@ from §15 consumes this output; none of it belongs in the decision path.
 
 ### Next
 
-1. Verify the two open Powens questions flagged in Milestone 5 (the
-   transaction sign convention, and whether `id_cluster` is a usable
-   recurrence signal) against a live sandbox, and recalibrate the
-   detector's thresholds against real transaction data rather than
-   hand-built fixtures once that's possible.
+1. Pull more real transaction history from the sandbox (multiple test
+   connections, more months) and check whether the detector's `0.4`
+   interval-regularity gate is genuinely too tight for real salary cadences,
+   or whether the one series checked so far (Milestone 5, above) was an
+   outlier — recalibrate only once there's more than one data point saying
+   so, and only in a way that keeps rejecting `test/detection.test.ts`'s
+   no-cadence grocery fixture.
 2. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.
