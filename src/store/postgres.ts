@@ -19,6 +19,7 @@ import type {
   MigrationRecord,
   MigrationStore,
   PortfolioStats,
+  PreparedMigration,
   TenantContext,
   WebhookDelivery,
   WebhookEndpoint,
@@ -603,6 +604,186 @@ export class PostgresStore implements MigrationStore {
       }
 
       return rowToMigration(row);
+    });
+  }
+
+  /**
+   * The batch-across-migrations counterpart to `createMigration` — see the
+   * doc comment on `MigrationStore.createMigrations`. Same table set as
+   * `createMigration`, just one multi-row `INSERT` per table across every
+   * migration in the batch instead of one `INSERT` per table per migration,
+   * and the row lands with its final state/completion already set rather
+   * than `CREATED`/0 plus a follow-up `updateMigration`.
+   */
+  async createMigrations(
+    ctx: TenantContext,
+    rows: PreparedMigration[],
+  ): Promise<MigrationRecord[]> {
+    if (rows.length === 0) return [];
+    return this.tx(ctx, async (c) => {
+      const now = new Date().toISOString();
+
+      let inserted;
+      try {
+        const MCOLS = 15;
+        const params: unknown[] = [];
+        for (const r of rows) {
+          const blockingCount = r.plan.exceptions.filter((e) => e.severity === 'BLOCKING').length;
+          params.push(
+            r.plan.migrationId,
+            ctx.tenantId,
+            r.plan.customerId,
+            r.plan.originInstitutionId,
+            r.plan.destinationInstitutionId,
+            r.batchId ?? null,
+            r.state,
+            r.completion,
+            blockingCount,
+            r.plan.estimatedTotalDurationDays,
+            r.plan.estimatedTotalFees.amount,
+            r.idempotencyKey ?? null,
+            now,
+            now,
+            JSON.stringify(r.plan),
+          );
+        }
+        inserted = (
+          await c.query(
+            `INSERT INTO migrations
+               (id, tenant_id, customer_id, origin_institution_id, destination_institution_id,
+                batch_id, state, completion, blocking_exception_count, estimated_duration_days,
+                estimated_fees_minor, idempotency_key, created_at, updated_at, plan_snapshot)
+             VALUES ${valuesPlaceholders(rows.length, MCOLS)}
+             RETURNING *`,
+            params,
+          )
+        ).rows;
+      } catch (err) {
+        const e = err as { code?: string; constraint?: string };
+        if (e.code === '23505' && e.constraint === 'migrations_tenant_id_idempotency_key_key') {
+          throw new ConflictError(`idempotency key already used by another migration`);
+        }
+        throw err;
+      }
+
+      const items = rows.flatMap((r) => r.plan.items.map((item) => ({ item, migrationId: r.plan.migrationId })));
+      if (items.length > 0) {
+        const COLS = 16;
+        const params: unknown[] = [];
+        for (const { item, migrationId } of items) {
+          params.push(
+            item.id,
+            ctx.tenantId,
+            migrationId,
+            item.subject,
+            item.subjectId,
+            item.productType ?? null,
+            item.category,
+            item.label,
+            item.action,
+            item.ruleId,
+            item.rationale,
+            item.balance?.amount ?? null,
+            item.balance?.currency ?? null,
+            item.preservesTaxHistory,
+            item.estimatedDurationDays,
+            item.estimatedFees?.amount ?? 0,
+          );
+        }
+        await c.query(
+          `INSERT INTO plan_items
+             (id, tenant_id, migration_id, subject, subject_id, product_type, category, label,
+              action, rule_id, rationale, balance_minor, currency, preserves_tax_history,
+              estimated_duration_days, estimated_fees_minor)
+           VALUES ${valuesPlaceholders(items.length, COLS)}`,
+          params,
+        );
+      }
+
+      const tasks = rows.flatMap((r) => {
+        const position = new Map(r.plan.executionOrder.map((id, idx) => [id, idx]));
+        return r.tasks.map((task) => ({
+          task,
+          migrationId: r.plan.migrationId,
+          position: position.get(task.id) ?? 0,
+        }));
+      });
+      if (tasks.length > 0) {
+        const COLS = 12;
+        const params: unknown[] = [];
+        for (const { task, migrationId, position } of tasks) {
+          params.push(
+            task.id,
+            ctx.tenantId,
+            migrationId,
+            task.itemId,
+            task.type,
+            task.label,
+            task.status,
+            task.actor,
+            task.slaDays,
+            task.dependencies,
+            JSON.stringify(task.documents),
+            position,
+          );
+        }
+        await c.query(
+          `INSERT INTO migration_tasks
+             (id, tenant_id, migration_id, item_id, type, label, status, actor, sla_days,
+              dependencies, documents, position)
+           VALUES ${valuesPlaceholders(tasks.length, COLS)}`,
+          params,
+        );
+      }
+
+      const exceptions = rows.flatMap((r) =>
+        [...r.plan.exceptions, ...r.exceptions].map((exc) => ({ exc, migrationId: r.plan.migrationId })),
+      );
+      if (exceptions.length > 0) {
+        const COLS = 8;
+        const params: unknown[] = [];
+        for (const { exc, migrationId } of exceptions) {
+          params.push(
+            exc.id,
+            ctx.tenantId,
+            migrationId,
+            exc.code,
+            exc.severity,
+            exc.message,
+            exc.resolution,
+            exc.subjectId,
+          );
+        }
+        await c.query(
+          `INSERT INTO migration_exceptions
+             (id, tenant_id, migration_id, code, severity, message, resolution, subject_id)
+           VALUES ${valuesPlaceholders(exceptions.length, COLS)}`,
+          params,
+        );
+      }
+
+      const events = rows.flatMap((r) => r.events);
+      if (events.length > 0) {
+        const COLS = 6;
+        const params: unknown[] = [];
+        for (const event of events) {
+          params.push(
+            ctx.tenantId,
+            event.migrationId,
+            event.sequence,
+            event.type,
+            JSON.stringify(event.payload),
+            event.occurredAt,
+          );
+        }
+        await c.query(
+          `INSERT INTO migration_events (tenant_id, migration_id, sequence, type, payload, occurred_at)
+           VALUES ${valuesPlaceholders(events.length, COLS)}`,
+          params,
+        );
+      }
+
+      return inserted.map(rowToMigration);
     });
   }
 

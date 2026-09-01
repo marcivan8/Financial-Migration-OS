@@ -674,6 +674,88 @@ rather than accumulating a duplicate — neither is a claim a mocked BullMQ
 could check. Guarded with `describe.skipIf(!REDIS_URL)`, so `npm test` with
 no Redis running still passes, just without those three.
 
+## Milestone 8 — batching migration creation across a batch
+
+```bash
+npm test   # 133 tests, unchanged — this milestone is a rewrite behind an
+           # existing interface, not new surface; see below for why no new
+           # test was added
+```
+
+The gap Milestone 6 left on purpose: `planBatch` still called
+`MigrationService.createMigration` once per customer, and that one call was
+never just "one transaction." `store.createMigration` inserted the
+migration/plan-items/tasks/exceptions in one transaction, but `persist()`
+then ran a *further* transaction for every task in the plan (an `UPDATE`
+per task, even the ones nothing changed — `CONNECT_ORIGIN` and
+`CLASSIFY_PRODUCTS` are simulated to completion synchronously, so this
+always ran), one for any fresh events, and one more for
+`updateMigration`'s final state write. A plan with 15 tasks meant on the
+order of 18 round trips before the next customer's migration even started —
+worse than the per-customer cost Milestone 6 fixed on the import side.
+
+**`MigrationService.prepareMigration` splits the two halves `createMigration`
+always did in one call**: validate the customer and institutions, read
+products and consent, run the planner, and simulate `CONNECT_ORIGIN`/
+`CLASSIFY_PRODUCTS` to completion — all in memory, nothing written — and
+hand back a `PreparedMigration` (the plan, final task statuses, every event
+already emitted, any exceptions raised). `planBatch` now runs this
+concurrently per customer, same as before (`concurrency`, still 25 by
+default, still bounded to 200 — reads were never the cost being fixed here,
+so they're still one call per customer). What changes is what happens next.
+
+**`store.createMigrations`** — the `createMigration` analogue of
+`importCustomers` — takes a whole chunk of `PreparedMigration`s and writes
+them in one transaction: one multi-row `INSERT` each for `migrations`,
+`plan_items`, `migration_tasks`, `migration_exceptions` and
+`migration_events`, regardless of how many migrations are in the chunk. A
+row lands with its **final** state and completion already set, because the
+caller already knows them — no intermediate `CREATED` row, no follow-up
+`updateMigration`. `MigrationService.persistPrepared` is the caller: chunks
+of `PLAN_CHUNK_SIZE` (200, same bound `importCustomers` uses and for the
+same reason), webhook-published after each chunk commits, with the same
+try-the-chunk-then-retry-one-at-a-time fallback `persistChunked` established
+for imports — a chunk that fails (most likely: an idempotency key collided
+with a migration created since `prepareMigration` ran) is retried singly,
+and a singleton retry that still conflicts is treated exactly like
+`createMigration`'s own conflict handling always was: look up the existing
+migration and report it as reused, not as a failure.
+
+**`createMigration` itself is untouched** — still the exact inline
+validate → plan → simulate → `store.createMigration` → `persist()` →
+`updateMigration` sequence it always was, just no longer what `planBatch`
+calls. Rebuilding it on top of `prepareMigration` would have meant
+reconciling `persist()`'s live-`Migration`-instance signature (which
+`authorize`, `advanceTask`, `simulate` and `resolveException` still need
+exactly as it is) with a plain `PreparedMigration` snapshot, for no benefit
+`POST /v1/migrations` callers would ever see — so the single-migration path
+was left alone and `prepareMigration` is a parallel implementation of the
+same validate/plan/simulate logic, not a shared one. That's the one real
+cost of this milestone: two places now need to agree on what "a freshly
+planned migration" looks like. The existing `batch planning` test suite in
+`test/batch.test.ts` covers `planBatch` end to end already — count
+assertions, idempotent re-planning, per-customer failure isolation, blocking
+counts, the exception queue reading back what was written — and all of it
+passed unmodified against real Postgres, which is the strongest signal
+available that the two paths still produce identical rows. No new test was
+written for this milestone for that reason: the existing coverage already
+exercises exactly the property that would break if `prepareMigration` and
+`createMigration` drifted, and it's Postgres-backed, not in-memory.
+
+**Measured, not assumed**: 500 imported customers, `planBatch({ concurrency:
+40 })`, same fixture population `seedPopulation` uses, against the same
+Postgres instance — **~9.4s calling `service.createMigration` once per
+customer (the old path, still there, just unused by `planBatch` now),
+~3.1s calling the batched path**, roughly 3x. Smaller than Milestone 6's
+~16x on import, because reads are still per-customer here (unchanged) and a
+migration's write payload — plan items, tasks, events, exceptions — is
+heavier and more varied per row than a customer import's, so there's
+proportionally less pure round-trip overhead to recover. The win is real,
+just smaller than the ceiling a fully-batched-including-reads version would
+hit — the same tradeoff call this Next list has made since Milestone 6:
+batch what's expensive, leave what already runs once per customer for a
+reason.
+
 ## Not built (deliberately)
 
 **No customer-facing surface**, no document AI, no ops copilot. The AI layer
@@ -686,12 +768,13 @@ from §15 consumes this output; none of it belongs in the decision path.
    recurrence signal) against a live sandbox, and recalibrate the
    detector's thresholds against real transaction data rather than
    hand-built fixtures once that's possible.
-2. `planBatch`'s `createMigration` calls are still one transaction per
-   customer (Milestone 6 only batched customer *import*, not planning) — the
-   same batch-across-customers tradeoff applies there if the remaining
-   per-migration transaction overhead matters at real volume.
-3. If webhook delivery ever needs more than one worker process: add a claim
+2. If webhook delivery ever needs more than one worker process: add a claim
    step to `listDueDeliveries` (Milestone 7 fixed the queue's own
    concurrency at 1 specifically because this wasn't built).
+3. `prepareMigration` duplicates `createMigration`'s validate/plan/simulate
+   logic rather than sharing it (Milestone 8's tradeoff, above) — worth
+   collapsing into one implementation if the two ever drift, which would
+   show up as `planBatch` and `POST /v1/migrations` disagreeing about what a
+   freshly planned migration looks like for the same input.
 4. Get the rule catalog in front of counsel before anything above is built on
    top of it — it is the moat, and right now it is an educated reading.

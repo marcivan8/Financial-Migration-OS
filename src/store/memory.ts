@@ -18,6 +18,7 @@ import type {
   MigrationRecord,
   MigrationStore,
   PortfolioStats,
+  PreparedMigration,
   TenantContext,
   WebhookDelivery,
   WebhookEndpoint,
@@ -194,6 +195,43 @@ export class InMemoryStore implements MigrationStore {
       });
     }
     return record;
+  }
+
+  /**
+   * No round trips to save here either — see `importCustomers`'s comment for
+   * why this store's version of a "batch across migrations" call is just the
+   * per-migration work run in sequence. What matters for parity with
+   * `PostgresStore` is that a row lands with its final state/completion
+   * directly, the same as the real batched path, rather than `CREATED`/0
+   * followed by an `updateMigration` this call never makes.
+   */
+  async createMigrations(
+    ctx: TenantContext,
+    rows: PreparedMigration[],
+  ): Promise<MigrationRecord[]> {
+    const out: MigrationRecord[] = [];
+    for (const r of rows) {
+      const record = await this.createMigration(ctx, r.plan, {
+        idempotencyKey: r.idempotencyKey,
+        batchId: r.batchId,
+      });
+      const next: MigrationRecord = { ...record, state: r.state, completion: r.completion };
+      this.migrations.set(next.id, next);
+      for (const task of r.tasks) {
+        this.tasks.set(task.id, { ...clone(task), tenantId: ctx.tenantId });
+      }
+      for (const exc of r.exceptions) {
+        this.exceptions.set(exc.id, {
+          ...clone(exc),
+          migrationId: r.plan.migrationId,
+          resolvedAt: null,
+          tenantId: ctx.tenantId,
+        });
+      }
+      if (r.events.length > 0) await this.appendEvents(ctx, r.events);
+      out.push(next);
+    }
+    return out;
   }
 
   async findByIdempotencyKey(

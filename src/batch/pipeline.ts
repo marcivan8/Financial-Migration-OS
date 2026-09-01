@@ -5,7 +5,12 @@ import type {
   RecurringPayment,
   Transaction,
 } from '../domain/types.js';
-import type { BatchRecord, MigrationStore, TenantContext } from '../store/types.js';
+import type {
+  BatchRecord,
+  MigrationStore,
+  PreparedMigration,
+  TenantContext,
+} from '../store/types.js';
 import { MigrationService, newId, ValidationError } from '../api/service.js';
 import type { ConnectivityProvider, SkippedAccount } from '../connectivity/types.js';
 import { detectRecurringPayments as runRecurringDetection } from '../detection/recurring.js';
@@ -435,7 +440,19 @@ export class BatchPipeline {
     return { customerId, detected, skippedTransactions };
   }
 
-  /** Plan every imported customer in bounded-concurrency chunks. */
+  /**
+   * Plan every imported customer in bounded-concurrency chunks.
+   *
+   * Each customer is still validated, read and planned individually — that
+   * part was never the cost `createMigration` calls added, and batching
+   * reads customers don't share isn't the same tradeoff Milestone 6 made for
+   * imports. What used to be one `store.createMigration` transaction (plus,
+   * inside it, a follow-up transaction per task, per event and per raised
+   * exception) *per customer* is now `service.persistPrepared` writing every
+   * customer prepared in this chunk in one round trip — the same
+   * batch-across-customers tradeoff Milestone 6 gave `importRows`, applied
+   * to planning instead of import.
+   */
   async planBatch(
     ctx: TenantContext,
     batchId: string,
@@ -455,9 +472,12 @@ export class BatchPipeline {
 
     for (let i = 0; i < customerIds.length; i += concurrency) {
       const chunk = customerIds.slice(i, i + concurrency);
-      const results = await Promise.allSettled(
+
+      // Validate, plan and simulate each customer's migration in memory,
+      // concurrently. Nothing is written yet — that's persistPrepared below.
+      const prepareResults = await Promise.allSettled(
         chunk.map((customerId) =>
-          this.service.createMigration(ctx, {
+          this.service.prepareMigration(ctx, {
             customerId,
             destinationInstitutionId: batch.destinationInstitutionId,
             batchId,
@@ -468,12 +488,10 @@ export class BatchPipeline {
         ),
       );
 
-      results.forEach((result, idx) => {
+      const toPersist: { customerId: string; prepared: PreparedMigration }[] = [];
+      prepareResults.forEach((result, idx) => {
         const customerId = chunk[idx]!;
-        if (result.status === 'fulfilled') {
-          planned++;
-          if (result.value.record.blockingExceptionCount > 0) blocked++;
-        } else {
+        if (result.status !== 'fulfilled') {
           failures.push({
             externalRef: customerId,
             customerId,
@@ -483,8 +501,34 @@ export class BatchPipeline {
                 : String(result.reason),
             stage: 'PLAN',
           });
+          return;
         }
+        if (result.value.kind === 'existing') {
+          // Idempotency key already resolved — nothing to persist.
+          planned++;
+          if (result.value.record.blockingExceptionCount > 0) blocked++;
+          return;
+        }
+        toPersist.push({ customerId, prepared: result.value.prepared });
       });
+
+      if (toPersist.length > 0) {
+        const { succeeded, failed } = await this.service.persistPrepared(ctx, toPersist);
+        for (const { customerId } of toPersist) {
+          const record = succeeded.get(customerId);
+          if (record) {
+            planned++;
+            if (record.blockingExceptionCount > 0) blocked++;
+          } else {
+            failures.push({
+              externalRef: customerId,
+              customerId,
+              reason: failed.get(customerId) ?? 'plan failed',
+              stage: 'PLAN',
+            });
+          }
+        }
+      }
 
       done += chunk.length;
       options.onProgress?.(done, customerIds.length);

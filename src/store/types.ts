@@ -134,6 +134,38 @@ export interface BatchRecord {
   completedAt: string | null;
 }
 
+/**
+ * A migration ready to persist: everything `MigrationService` computed in
+ * memory while planning it — the plan, its final task statuses, every event
+ * emitted while producing it, and any exceptions raised along the way — but
+ * has not written anywhere yet. `createMigrations` turns a batch of these
+ * into rows in one round trip; see its doc comment on `MigrationStore`.
+ */
+export interface PreparedMigration {
+  plan: MigrationPlan;
+  /**
+   * Final task statuses. `plan.tasks` is what the planner produced (mostly
+   * `PENDING`); this is that same task set after `CONNECT_ORIGIN` and
+   * `CLASSIFY_PRODUCTS` have already been simulated to completion, the way
+   * every migration starts.
+   */
+  tasks: MigrationTask[];
+  /** Every event the migration emitted while being created. All fresh — nothing about this migration is stored yet. */
+  events: MigrationEvent[];
+  /**
+   * Exceptions raised while simulating post-plan task completion — NOT
+   * `plan.exceptions` (planning-time), which the store inserts on its own
+   * the same way `createMigration` already does for a single migration.
+   * Almost always empty: nothing in the post-plan simulation
+   * (`CONNECT_ORIGIN`/`CLASSIFY_PRODUCTS` completing) currently blocks.
+   */
+  exceptions: MigrationException[];
+  state: MigrationState;
+  completion: number;
+  idempotencyKey?: string;
+  batchId?: string;
+}
+
 export interface PortfolioStats {
   total: number;
   byState: Record<string, number>;
@@ -186,6 +218,34 @@ export interface MigrationStore {
     plan: MigrationPlan,
     options: { idempotencyKey?: string; batchId?: string },
   ): Promise<MigrationRecord>;
+  /**
+   * Create several migrations — each with its plan items, tasks (already in
+   * their final post-creation status), events and exceptions — as one unit.
+   * The `createMigration` analogue of `importCustomers` (Milestone 6): on the
+   * Postgres adapter this is one transaction and up to five multi-row
+   * `INSERT`s regardless of how many migrations are in the batch, instead of
+   * one transaction per migration (`createMigration` itself) plus a further
+   * transaction per task, per fresh event and per raised exception
+   * (`MigrationService.persist`, called once per migration today).
+   *
+   * Unlike `createMigration`, a row here is inserted with its FINAL state
+   * and completion already known — the caller has already simulated the
+   * post-creation task completions (`CONNECT_ORIGIN`, `CLASSIFY_PRODUCTS`)
+   * in memory before calling this — so there is no intermediate `CREATED`
+   * row and no follow-up `updateMigration` call needed to reach the state a
+   * freshly planned migration actually starts in.
+   *
+   * Same cost as `importCustomers`: a failure partway through rolls the
+   * whole batch back together, not just the migration that caused it.
+   * `BatchPipeline.planBatch` is the caller that cares about per-migration
+   * isolation, and gets it back the same way `persistChunked` does — retry
+   * the same call with a batch of one for whichever migrations were in a
+   * batch that failed.
+   */
+  createMigrations(
+    ctx: TenantContext,
+    rows: PreparedMigration[],
+  ): Promise<MigrationRecord[]>;
   findByIdempotencyKey(ctx: TenantContext, key: string): Promise<MigrationRecord | null>;
   getMigration(ctx: TenantContext, id: string): Promise<MigrationRecord | null>;
   getPlan(ctx: TenantContext, migrationId: string): Promise<MigrationPlan | null>;
